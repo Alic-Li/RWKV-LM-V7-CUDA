@@ -77,7 +77,7 @@ JSONL 与 `rwkv_lightning_cuda` 的文本约定一致。每行是独立文档，
 `hip/` 提供与 CUDA 训练路径对应的 9 个 HIP 源文件。原生 C++ 接口位于 `hip/rwkv7_training_ops.hpp`，由调用方传入 HIP stream 和设备缓冲区。安装 ROCm 后，可从项目根目录按目标 GPU 架构单独构建静态库，例如 MI300 使用以下命令。
 
 ```bash
-cmake -S hip -B build-hip -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_ARCHITECTURES=gfx942
+cmake -S hip -B build-hip -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_ARCHITECTURES=gfx90a
 cmake --build build-hip
 ```
 

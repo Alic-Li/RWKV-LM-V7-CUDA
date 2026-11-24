@@ -21,7 +21,9 @@ constexpr float W_SCALE = -0.6065306597f; // -exp(-0.5)
 
 //######################################################################################################
 
-template<int N> __launch_bounds__(N,2)
+// HIP counts waves per SIMD, whereas CUDA counts blocks per SM.
+// Keep the block-size bound without imposing the H100 residency hint on HIP.
+template<int N> __launch_bounds__(N)
 __global__ void forward_kernel_preload(int T,int H,F_ r_,F_ w_,F_ k_,F_ v_,F_ a_,F_ b_,bf* __restrict__ y_,float* s__,float* __restrict__ sa_)
 {
     const int bb=blockIdx.y, hh=blockIdx.x, i=threadIdx.x;
