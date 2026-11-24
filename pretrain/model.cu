@@ -1,4 +1,8 @@
 #include "model.hpp"
+#include "layer_norm.hpp"
+#include "value_bias.hpp"
+#include "embedding.hpp"
+#include "gradient_norm.hpp"
 
 #include "rwkv7_training_ops.hpp"
 #include "gpu.hpp"
@@ -18,6 +22,9 @@ unsigned grid(Count n) { return (n + threads - 1) / threads; }
 struct Device {
   explicit Device(int id) : id(id) {
     CUDA(cudaSetDevice(id));
+    cudaDeviceProp properties;
+    CUDA(cudaGetDeviceProperties(&properties, id));
+    resident_threads = properties.multiProcessorCount * properties.maxThreadsPerMultiProcessor;
     CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     try {
       blas_ok(cublasCreate(&blas));
@@ -44,7 +51,7 @@ struct Device {
       throw std::runtime_error(std::string("cuBLAS: ") +
                                cublasGetStatusString(status));
   }
-  int id;
+  int id, resident_threads;
   cudaStream_t stream = nullptr;
   cublasHandle_t blas = nullptr;
 };
@@ -58,10 +65,10 @@ __global__ void to_bf(const float *input, BF *out, Count n) {
   if (i < n)
     out[i] = bf(input[i]);
 }
-__global__ void add_bf_to_float(const BF *x, float *y, Count n) {
+__global__ void add_bf_to_float(const BF *x, float *y, Count n, float scale = 1.f) {
   const auto i = tid();
   if (i < n)
-    y[i] += fl(x[i]);
+    y[i] += fl(bf(fl(x[i]) * scale));
 }
 __global__ void add(BF *x, const BF *y, BF *out, Count n) {
   const auto i = tid();
@@ -71,7 +78,7 @@ __global__ void add(BF *x, const BF *y, BF *out, Count n) {
 __global__ void add_three(BF *x, const BF *y, const BF *z, Count n) {
   const auto i = tid();
   if (i < n)
-    x[i] = bf(fl(bf(fl(x[i]) + fl(y[i]))) + fl(z[i]));
+    x[i] = bf(fl(bf(fl(z[i]) + fl(x[i]))) + fl(y[i]));
 }
 __global__ void add_bias(BF *x, const BF *bias, Count n, int c) {
   const auto i = tid();
@@ -88,137 +95,23 @@ __global__ void activate_element(BF *x, Count n, Activation fn) {
   }
 }
 __global__ void activate_backward(BF *dx, const BF *activation, Count n,
-                                  Activation fn) {
+                                  Activation fn, bool recompute) {
   const auto i = tid();
   if (i < n) {
     const float a = fl(activation[i]);
-    dx[i] =
-        bf(fl(dx[i]) * (fn == Activation::Tanh ? 1.f - a * a : a * (1.f - a)));
-  }
-}
-
-template <typename T> __device__ float float_value(T x) { return x; }
-template <> __device__ float float_value(BF x) { return fl(x); }
-
-// One warp-sized channel tile per block, with 8-way reduction over rows.
-template <typename T>
-__global__ void sum_columns(const T *x, float *out, int rows, int c) {
-  __shared__ float partial[8][32];
-  const int col = int(blockIdx.x) * 32 + threadIdx.x;
-  const int lane = threadIdx.y;
-  float s = 0;
-  if (col < c) {
-    const int begin = int(blockIdx.y) * 128;
-    for (int r = begin + lane; r < min(rows, begin + 128); r += blockDim.y)
-      s += float_value(x[Count(r) * c + col]);
-  }
-  partial[lane][threadIdx.x] = s;
-  __syncthreads();
-  if (lane == 0 && col < c) {
-    for (int y = 1; y < 8; ++y)
-      s += partial[y][threadIdx.x];
-    atomicAdd(out + col, s);
-  }
-}
-
-// LayerNorm follows the row-wise FP32 reductions in rwkv_lightning_cuda.
-__device__ float warp_sum(float x) {
-  for (int off = 16; off > 0; off /= 2)
-    x += __shfl_down_sync(0xffffffff, x, off);
-  return x;
-}
-__device__ float block_sum(float x, float *scratch) {
-  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-  x = warp_sum(x);
-  if (!lane)
-    scratch[warp] = x;
-  __syncthreads();
-  if (!warp) {
-    x = warp_sum(lane < threads / 32 ? scratch[lane] : 0.f);
-    if (!lane)
-      scratch[0] = x;
-  }
-  __syncthreads();
-  const float sum = scratch[0];
-  __syncthreads();
-  return sum;
-}
-
-__global__ void layer_norm(const BF *x, const BF *residual, BF *sum,
-                           const BF *w, const BF *b, BF *out, float *mean_out,
-                           float *inv_out, int c) {
-  __shared__ float scratch[threads / 32];
-  const auto off = Count(blockIdx.x) * c;
-  if (residual) {
-    for (int i = threadIdx.x; i < c; i += threads)
-      sum[off + i] = bf(fl(x[off + i]) + fl(residual[off + i]));
-    x = sum;
-  }
-  float s = 0;
-  for (int i = threadIdx.x; i < c; i += threads)
-    s += fl(x[off + i]);
-  const float mean = block_sum(s, scratch) / c;
-  s = 0;
-  for (int i = threadIdx.x; i < c; i += threads) {
-    const float d = fl(x[off + i]) - mean;
-    s += d * d;
-  }
-  const float inv = rsqrtf(block_sum(s, scratch) / c + 1e-5f);
-  if (!threadIdx.x) {
-    mean_out[blockIdx.x] = mean;
-    inv_out[blockIdx.x] = inv;
-  }
-  for (int i = threadIdx.x; i < c; i += threads)
-    out[off + i] = bf((fl(x[off + i]) - mean) * inv * fl(w[i]) + fl(b[i]));
-}
-
-__global__ void layer_norm_input_backward(const BF *x, const BF *dy,
-                                          const BF *w, const float *mean,
-                                          const float *inv, BF *dx, int c) {
-  __shared__ float scratch[threads / 32];
-  const auto off = Count(blockIdx.x) * c;
-  const float m = mean[blockIdx.x], r = inv[blockIdx.x];
-  float s = 0, p = 0;
-  for (int i = threadIdx.x; i < c; i += threads) {
-    const float g = fl(dy[off + i]) * fl(w[i]);
-    s += g;
-    p += g * ((fl(x[off + i]) - m) * r);
-  }
-  s = block_sum(s, scratch) / c;
-  p = block_sum(p, scratch) / c;
-  for (int i = threadIdx.x; i < c; i += threads)
-    dx[off + i] =
-        bf(r * (fl(dy[off + i]) * fl(w[i]) - s - (fl(x[off + i]) - m) * r * p));
-}
-
-__global__ void layer_norm_param_backward(const BF *x, const BF *dy,
-                                          const float *mean, const float *inv,
-                                          float *dw, float *db, int rows,
-                                          int c) {
-  __shared__ float partial_w[8][32], partial_b[8][32];
-  const int col = int(blockIdx.x) * 32 + threadIdx.x;
-  const int lane = threadIdx.y;
-  float w = 0, b = 0;
-  if (col < c) {
-    const int begin = int(blockIdx.y) * 128;
-    for (int row = begin + lane; row < min(rows, begin + 128);
-         row += blockDim.y) {
-      const auto i = Count(row) * c + col;
-      const float g = fl(dy[i]);
-      b += g;
-      w += g * (fl(x[i]) - mean[row]) * inv[row];
+    const float g = fl(dx[i]);
+    if (!recompute) {
+      // The optimized TorchScript backward fuses the elementwise derivative
+      // in FP32 and casts its result back to BF16.
+      const float derivative = fn == Activation::Tanh ? 1.f - a * a : (1.f - a) * a;
+      dx[i] = bf(g * derivative);
+    } else if (fn == Activation::Tanh) {
+      const BF derivative = bf(1.f - fl(bf(a * a)));
+      dx[i] = bf(g * fl(derivative));
+    } else {
+      const BF scaled = bf(g * fl(bf(1.f - a)));
+      dx[i] = bf(fl(scaled) * a);
     }
-  }
-  partial_w[lane][threadIdx.x] = w;
-  partial_b[lane][threadIdx.x] = b;
-  __syncthreads();
-  if (lane == 0 && col < c) {
-    for (int y = 1; y < 8; ++y) {
-      w += partial_w[y][threadIdx.x];
-      b += partial_b[y][threadIdx.x];
-    }
-    atomicAdd(dw + col, w);
-    atomicAdd(db + col, b);
   }
 }
 
@@ -229,52 +122,29 @@ __global__ void gather(const BF *table, const int *indices, BF *out, Count n,
     out[i] = table[Count(indices[i / c]) * c + i % c];
 }
 __global__ void scatter(const BF *input, const int *indices, BF *out, Count n,
-                        int c) {
+                        int c, float scale) {
   const auto i = tid();
   if (i < n)
-    out[Count(indices[i / c]) * c + i % c] = input[i];
+    out[Count(indices[i / c]) * c + i % c] = bf(fl(input[i]) * scale);
 }
-__global__ void embedding_backward(const BF *input, const int *indices,
-                                   float *out, Count n, int c) {
-  const auto i = tid();
-  if (i < n)
-    atomicAdd(out + Count(indices[i / c]) * c + i % c, fl(input[i]));
-}
-
-__global__ void gradient_stats(const float *g, Count n, float *sum, int *bad,
-                               bool clip) {
-  __shared__ float scratch[threads / 32];
-  float acc = 0.f;
+__global__ void check_finite(const float *gradient, Count n, int *bad) {
   bool invalid = false;
-  for (auto i = tid(); i < n; i += Count(gridDim.x) * threads) {
-    const auto v = g[i];
-    invalid |= !isfinite(v);
-    if (clip)
-      acc += v * v;
-  }
+  for (auto i = tid(); i < n; i += Count(gridDim.x) * threads)
+    invalid |= !isfinite(gradient[i]);
   if (__syncthreads_or(invalid) && !threadIdx.x)
     atomicExch(bad, 1);
-  if (clip) {
-    const auto local = block_sum(acc, scratch);
-    if (!threadIdx.x)
-      atomicAdd(sum, local);
-  }
 }
 
-__global__ void adam_update(BF *weight, float *master, const float *grad,
-                            float *m, float *v, Count n, Adam opt,
-                            float inv_bc1, float inv_bc2, float lr, float decay,
-                            float scale) {
+// Each BF16 parameter receives a BF16 gradient from one backward pass.
+__global__ void finish_microbatch(float *grad, float *accumulated, Count n) {
   const auto i = tid();
-  if (i >= n)
-    return;
-  const float g = grad[i] * scale;
-  const float a = m[i] = opt.beta1 * m[i] + (1.f - opt.beta1) * g;
-  const float b = v[i] = opt.beta2 * v[i] + (1.f - opt.beta2) * g * g;
-  const float p = master[i] * (1.f - lr * decay) -
-                  lr * (a * inv_bc1) / (sqrtf(b * inv_bc2) + opt.eps);
-  master[i] = p;
-  weight[i] = bf(p);
+  if (i < n) {
+    const float value = fl(bf(grad[i]));
+    if (accumulated)
+      accumulated[i] += value;
+    else
+      grad[i] = value;
+  }
 }
 
 struct Param {
@@ -363,6 +233,31 @@ struct Model::Impl {
     CUDA(cudaMemsetAsync(p, 0, size * sizeof(T), stream()));
   }
 
+  std::vector<GradientSlice> norm_slices() const {
+    // clip_grad_norm_ follows named_parameters() and skips the unused
+    // value-residual parameters in the first block.
+    std::vector<GradientSlice> slices;
+    const auto append = [&](std::initializer_list<Param> parameters) {
+      for (const auto &p : parameters)
+        slices.push_back({p.offset, p.size});
+    };
+    append({embed});
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+      const auto &b = blocks[i];
+      append({b.ln1.w, b.ln1.b, b.ln2.w, b.ln2.b});
+      if (i == 0)
+        append({ln0.w, ln0.b});
+      for (const auto &p : b.mix)
+        append({p});
+      append({b.w.first, b.w.second, b.w0, b.a.first, b.a.second, b.a0});
+      if (i > 0)
+        append({b.v_res.first, b.v_res.second, b.v0});
+      append({b.g.first, b.g.second, b.kk, b.ka, b.rk, b.r, b.k, b.v, b.out,
+              b.group_norm.w, b.group_norm.b, b.ffn_mix, b.ffn_key, b.ffn_value});
+    }
+    append({ln_out.w, ln_out.b, head});
+    return slices;
+  }
   NormWeights norm_weights(const std::string &name) const {
     return {params.at(name + ".weight"), params.at(name + ".bias")};
   }
@@ -429,19 +324,15 @@ struct Model::Impl {
   NormCache normalize(const BF *x, NormWeights p, const BF *residual = nullptr,
                       BF *sum = nullptr) const {
     NormCache norm{bf_buffer(n), fp_buffer(rows), fp_buffer(rows)};
-    layer_norm<<<rows, threads, 0, stream()>>>(x, residual, sum, p.w.w, p.b.w,
-                                               norm.out.get(), norm.mean.get(),
-                                               norm.inv.get(), c);
+    layer_norm(stream(), rows, c, x, residual, sum, p.w.w, p.b.w,
+               norm.out.get(), norm.mean.get(), norm.inv.get());
     return norm;
   }
   Buffer<BF> normalize_backward(const BF *x, const BF *dy, const NormCache &f,
                                 NormWeights p) const {
     auto dx = bf_buffer(n);
-    layer_norm_input_backward<<<rows, threads, 0, stream()>>>(
-        x, dy, p.w.w, f.mean.get(), f.inv.get(), dx.get(), c);
-    layer_norm_param_backward<<<dim3((c + 31) / 32, (rows + 127) / 128),
-                                dim3(32, 8), 0, stream()>>>(
-        x, dy, f.mean.get(), f.inv.get(), p.w.g, p.b.g, rows, c);
+    layer_norm_backward(stream(), rows, c, x, dy, p.w.w, f.mean.get(),
+                        f.inv.get(), dx.get(), p.w.g, p.b.g);
     return dx;
   }
   Buffer<BF> low_rank(const BF *x, LowRank p, Buffer<BF> &hidden) const {
@@ -467,12 +358,8 @@ struct Model::Impl {
     auto dh = linear_backward(hidden, p.second, dy, p.rank, c, false);
     const Count elems = Count(rows) * p.rank;
     activate_backward<<<grid(elems), threads, 0, stream()>>>(dh.get(), hidden,
-                                                             elems, activation);
+                                                             elems, activation, checkpoint);
     return linear_backward(x, p.first, dh.get(), c, p.rank, false);
-  }
-  template <class T> void sum(const T *x, Param p) const {
-    sum_columns<<<dim3((c + 31) / 32, (rows + 127) / 128), dim3(32, 8), 0,
-                  stream()>>>(x, p.g, rows, c);
   }
   BlockCache forward_block(const BF *x, BF *first,
                            const BlockWeights &p, bool need_output) const {
@@ -591,7 +478,7 @@ struct Model::Impl {
     alpha_backward(stream(), rows, c, d_alpha.get(), p.a0.w, f.a_pre.get(),
                    d_a_pre.get(), partial.get(), d_a0.get());
     add_bf_to_float<<<grid(c), threads, 0, stream()>>>(d_a0.get(), p.a0.g, c);
-    sum(ww.get(), p.w0);
+    value_bias_gradient(stream(), rows, c, gpu.resident_threads, ww.get(), p.w0.g);
 
     std::array<Buffer<BF>, 6> gradients;
     gradients[0] = linear_backward(f.mixed[0].get(), p.r, dr.get(), c, c);
@@ -610,7 +497,7 @@ struct Model::Impl {
                           p.v0.w, f.v_pre.get(), d_raw_v.get(), d_base.get(),
                           d_pre_fp.get());
       add<<<grid(n), threads, 0, stream()>>>(d_first, d_base.get(), d_first, n);
-      sum(d_pre_fp.get(), p.v0);
+      value_bias_gradient(stream(), rows, c, gpu.resident_threads, d_pre_fp.get(), p.v0.g);
       to_bf<<<grid(n), threads, 0, stream()>>>(d_pre_fp.get(), d_v_pre.get(),
                                                n);
       gradients[3] =
@@ -640,6 +527,7 @@ struct Model::Impl {
   }
 
   Device gpu;
+  std::unique_ptr<GradientNorm> gradient_norm;
   Shape shape;
   Weights layout;
   int batch = 0, time = 0, rows = 0;
@@ -647,7 +535,7 @@ struct Model::Impl {
   Count n = 0, total = 0;
   bool optimized_wkv, checkpoint;
   Buffer<BF> weights;
-  Buffer<float> master, gradient, first_moment, second_moment;
+  Buffer<float> master, gradient, accumulated, first_moment, second_moment;
   std::unordered_map<std::string, Param> params;
   Param embed, head;
   NormWeights ln0, ln_out;
@@ -670,19 +558,25 @@ void Model::synchronize() const {
   CUDA(cudaStreamSynchronize(stream()));
 }
 std::size_t Model::parameter_count() const { return impl_->total; }
-float *Model::gradients() { return impl_->gradient.get(); }
-void Model::clear_gradients() {
+float *Model::gradients() const {
+  return impl_->accumulated.get() ? impl_->accumulated.get() : impl_->gradient.get();
+}
+void Model::clear_gradients(bool accumulate_microbatches) {
   activate();
+  if (accumulate_microbatches && !impl_->accumulated.get())
+    impl_->accumulated = impl_->fp_buffer(parameter_count());
   impl_->zero(gradients(), parameter_count());
 }
 
-void Model::accumulate(MicroBatch &batch, float inv_tokens) {
+void Model::accumulate(MicroBatch &batch, std::size_t total_targets) {
   const int active = batch.active_rows.size();
   if (!active)
     return;
   activate();
   auto &m = *impl_;
   const auto s = stream();
+  if (m.accumulated.get())
+    m.zero(m.gradient.get(), m.total);
   m.batch = batch.lanes;
   m.time = batch.time;
   m.rows = m.batch * m.time;
@@ -721,6 +615,11 @@ void Model::accumulate(MicroBatch &batch, float inv_tokens) {
   m.zero(d_hidden.get(), m.n);
   batch.losses.resize(active);
   {
+    // The fused loss returns a local mean. Its scalar upstream is applied
+    // after the chunked head backward has written its BF16 gradients.
+    const float head_scale = __bfloat162float(__float2bfloat16_rn(
+        static_cast<float>(static_cast<double>(active) / total_targets)));
+    const auto head_grad = m.bf_buffer(m.head.size);
     const int chunk = std::min(m.head_chunk, active);
     const auto logits = m.bf_buffer(Count(chunk) * m.shape.vocab);
     const auto x = m.bf_buffer(Count(chunk) * m.c);
@@ -735,13 +634,17 @@ void Model::accumulate(MicroBatch &batch, float inv_tokens) {
       m.gemm(count, m.shape.vocab, m.c, x.get(), false, m.head.w, true,
              logits.get(), CUDA_R_16BF, 0.f);
       head_loss(s, count, m.shape.vocab, logits.get(), labels.get() + start,
-                losses.get() + start, inv_tokens);
-      m.linear_backward_rows(x.get(), m.head, logits.get(), dx.get(), count,
-                             m.c, m.shape.vocab, true);
+                losses.get() + start, 1.f / active);
+      m.gemm(count, m.c, m.shape.vocab, logits.get(), false, m.head.w, false,
+             dx.get(), CUDA_R_16BF, 0.f);
+      m.gemm(m.shape.vocab, m.c, count, logits.get(), true, x.get(), false,
+             head_grad.get(), CUDA_R_16BF, start == 0 ? 0.f : 1.f);
       scatter<<<grid(elems), threads, 0, s>>>(dx.get(), idx, d_hidden.get(),
-                                              elems, m.c);
+                                              elems, m.c, head_scale);
       start += count;
     }
+    add_bf_to_float<<<grid(m.head.size), threads, 0, s>>>(
+        head_grad.get(), m.head.g, m.head.size, head_scale);
     CUDA(cudaMemcpyAsync(batch.losses.data(), losses.get(),
                          active * sizeof(float), cudaMemcpyDeviceToHost, s));
   }
@@ -761,51 +664,56 @@ void Model::accumulate(MicroBatch &batch, float inv_tokens) {
     dy = m.backward_block(x, dy.get(), base, d_first.get(), f, p);
   }
   const auto d_emb = m.normalize_backward(emb.get(), dy.get(), ln0, m.ln0);
-  embedding_backward<<<grid(m.n), threads, 0, s>>>(d_emb.get(), tokens.get(),
-                                                   m.embed.g, m.n, m.c);
+  embedding_gradient(s, m.rows, m.c, tokens.get(), d_emb.get(), m.embed.g);
+  finish_microbatch<<<grid(m.total), threads, 0, s>>>(
+      m.gradient.get(), m.accumulated.get(), m.total);
   CUDA(cudaGetLastError());
 }
 
 float Model::gradient_scale(float clip) const {
   activate();
   const auto s = stream();
-  const auto &m = *impl_;
-  const auto sum = m.fp_buffer(1);
+  auto &m = *impl_;
+  if (clip > 0.f) {
+    if (!m.gradient_norm)
+      m.gradient_norm = std::make_unique<GradientNorm>(s, m.gpu.resident_threads, m.norm_slices());
+    const float norm = m.gradient_norm->compute(s, gradients());
+    if (!std::isfinite(norm))
+      throw std::runtime_error("non-finite gradient norm");
+    // PyTorch scalar / tensor uses reciprocal followed by multiplication.
+    return std::min(1.f, (1.f / (norm + 1e-6f)) * clip);
+  }
   const Buffer<int> bad(s, 1);
-  m.zero(sum.get(), 1);
   m.zero(bad.get(), 1);
-  gradient_stats<<<std::min(grid(m.total), 4096u), threads, 0, s>>>(
-      m.gradient.get(), m.total, sum.get(), bad.get(), clip > 0.f);
-  CUDA(cudaGetLastError());
-  float norm2;
+  check_finite<<<std::min(grid(m.total), 4096u), threads, 0, s>>>(
+      gradients(), m.total, bad.get());
   int nonfinite;
-  CUDA(cudaMemcpyAsync(&norm2, sum.get(), sizeof(float), cudaMemcpyDeviceToHost,
-                       s));
-  CUDA(cudaMemcpyAsync(&nonfinite, bad.get(), sizeof(int),
-                       cudaMemcpyDeviceToHost, s));
+  CUDA(cudaMemcpyAsync(&nonfinite, bad.get(), sizeof(int), cudaMemcpyDeviceToHost, s));
   synchronize();
-  if (nonfinite || !std::isfinite(norm2))
-    throw std::runtime_error("non-finite gradient or gradient norm");
-  return clip > 0 ? std::min(1.f, clip / (std::sqrt(norm2) + 1e-6f)) : 1.f;
+  if (nonfinite)
+    throw std::runtime_error("non-finite gradient");
+  return 1.f;
 }
 
 void Model::update(const Adam &opt, std::uint64_t step, float scale) {
   activate();
   auto &m = *impl_;
-  const float inv_bc1 = 1.0 / (1.0 - std::pow(double(opt.beta1), double(step)));
-  const float inv_bc2 = 1.0 / (1.0 - std::pow(double(opt.beta2), double(step)));
+  const auto standard = adam_step(opt, step, opt.lr, 0.);
+  const auto decayed = adam_step(opt, step, opt.lr, opt.decay);
+  const auto faster = adam_step(opt, step, 2. * opt.lr, 0.);
   for (const auto &w : m.layout) {
     const auto p = m.params.at(w.name);
-    const float lr =
-        w.name.find(".att.w0") != std::string::npos ? 2 * opt.lr : opt.lr;
-    const float decay =
-        w.dims.size() == 2 && w.name.find(".weight") != std::string::npos
-            ? opt.decay
-            : 0.f;
-    adam_update<<<grid(p.size), threads, 0, stream()>>>(
-        p.w, m.master.get() + p.offset, p.g, m.first_moment.get() + p.offset,
-        m.second_moment.get() + p.offset, p.size, opt, inv_bc1, inv_bc2, lr,
-        decay, scale);
+    const float *grad = gradients() + p.offset;
+    // The first layer supplies v_first and has no value-residual branch.
+    if (w.name == "blocks.0.att.v0" || w.name == "blocks.0.att.v1" ||
+        w.name == "blocks.0.att.v2")
+      continue;
+    const bool use_decay = w.dims.size() == 2 && w.name.find(".weight") != std::string::npos;
+    const auto &options = w.name.find(".att.w0") != std::string::npos
+                              ? faster : (use_decay ? decayed : standard);
+    adam_update(stream(), p.w, m.master.get() + p.offset, grad,
+                m.first_moment.get() + p.offset, m.second_moment.get() + p.offset,
+                p.size, options, scale);
   }
   CUDA(cudaGetLastError());
 }

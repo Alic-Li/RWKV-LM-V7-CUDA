@@ -159,7 +159,7 @@ __global__ void row_chunk_loss_and_grad_kernel(
 namespace rwkv {
 void head_loss(cudaStream_t s, int rows, int vocab, BF *logits,
                const int64_t *labels, float *loss, float inv_tokens) {
-  row_chunk_loss_and_grad_kernel<BF, 256>
-      <<<rows, 256, 0, s>>>(logits, labels, loss, 0, rows, vocab, inv_tokens);
+  row_chunk_loss_and_grad_kernel<BF, 512>
+      <<<rows, 512, 0, s>>>(logits, labels, loss, 0, rows, vocab, inv_tokens);
 }
 } // namespace rwkv

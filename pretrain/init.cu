@@ -18,8 +18,10 @@ void solver_ok(cusolverStatus_t result) {
 
 __global__ void save_signs(const float *q, float *signs, int m, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n)
-    signs[i] = q[std::size_t(i) * (m + 1)] < 0 ? -1.f : 1.f;
+  if (i < n) {
+    const float diagonal = q[std::size_t(i) * (m + std::size_t(1))];
+    signs[i] = float((diagonal > 0.f) - (diagonal < 0.f));
+  }
 }
 
 __global__ void pack_q(const float *q, const float *signs, __nv_bfloat16 *out,

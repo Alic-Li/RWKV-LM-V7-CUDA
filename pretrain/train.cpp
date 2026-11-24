@@ -31,7 +31,7 @@ struct Config {
   Index steps, epoch_save, bucket_mib, warmup, start_step, start_window, seed;
   bool optimized_wkv, checkpoint_activations;
   Adam adam;
-  float final_lr;
+  double final_lr;
 };
 
 std::vector<int> parse_devices(const std::string &text) {
@@ -81,11 +81,11 @@ Config config(int argc, char **argv) {
   c.seed = options.number<Index>("--seed", 1234);
   c.optimized_wkv = boolean(options, "--wkv-v3", false);
   c.checkpoint_activations = boolean(options, "--activation-checkpoint", true);
-  c.adam = {float(options.real("--lr", 6e-4)),
-            float(options.real("--beta1", .9)),
-            float(options.real("--beta2", .99)),
-            float(options.real("--adam-eps", 1e-18)),
-            float(options.real("--weight-decay", 0)),
+  c.adam = {options.real("--lr", 6e-4),
+            options.real("--beta1", .9),
+            options.real("--beta2", .99),
+            options.real("--adam-eps", 1e-18),
+            options.real("--weight-decay", 0),
             float(options.real("--clip", 1))};
   c.final_lr = options.real("--lr-final", c.adam.lr);
   options.finish();
@@ -316,7 +316,7 @@ void fill_ranks(MicroBatch *ranks, std::vector<Lane> &lanes, const Dataset &data
   }
 }
 
-float learning_rate(const Config &c, Index i) {
+double learning_rate(const Config &c, Index i) {
   if (i < c.warmup)
     return c.adam.lr * (0.01 + 0.99 * double(i) / c.warmup);
   const auto end = c.start_step + c.steps - 1;
@@ -442,12 +442,11 @@ void run(Config c) {
     auto opt = c.adam;
     opt.lr = learning_rate(c, step - 1);
     if (valid) {
-      const float inv_tokens = 1.f / valid;
       auto accumulate_rank = [&](std::size_t rank) {
         auto &model = *models[rank];
-        model.clear_gradients();
+        model.clear_gradients(c.accum > 1);
         for (std::size_t i = rank; i < micro.size(); i += models.size())
-          model.accumulate(micro[i], inv_tokens);
+          model.accumulate(micro[i], valid);
       };
       std::vector<std::future<void>> workers;
       for (std::size_t rank = 1; rank < models.size(); ++rank)

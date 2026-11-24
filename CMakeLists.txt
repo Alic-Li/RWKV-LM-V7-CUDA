@@ -18,14 +18,19 @@ add_executable(rwkv7_init pretrain/init.cu)
 target_link_libraries(rwkv7_init PRIVATE rwkv_pth CUDA::cusolver)
 add_executable(rwkv7_train pretrain/train.cpp pretrain/dataset.cpp pretrain/model.cu
   pretrain/compat/jsonl.cpp
+  cuda/gradient_norm.cu cuda/embedding.cu cuda/adamw.cu cuda/value_bias.cu cuda/layer_norm.cu
   cuda/rwkv7_clampw.cu cuda/rwkv7_clampw_v3_for_h100.cu
   cuda/rwkv7_cmix_bf16_v5.cu cuda/rwkv7_head_l2wrap_ce_bf16_v4.cu
   cuda/rwkv7_tmix_a_gate_bf16.cu cuda/rwkv7_tmix_kk_pre_bf16_v5.cu
   cuda/rwkv7_tmix_lnx_rkvres_xg_bf16_v1.cu cuda/rwkv7_tmix_mix6_bf16_v5.cu
   cuda/rwkv7_tmix_vres_gate_bf16_v1.cu)
-target_include_directories(rwkv7_train PRIVATE cuda)
+target_include_directories(rwkv7_train PRIVATE cuda pretrain)
 target_compile_definitions(rwkv7_train PRIVATE _N_=64 _CHUNK_LEN_=16)
 target_compile_options(rwkv7_train PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+# Match ATen division, square root and denormal handling in these operators.
+set_source_files_properties(pretrain/model.cu cuda/gradient_norm.cu cuda/embedding.cu
+  cuda/value_bias.cu cuda/layer_norm.cu cuda/adamw.cu PROPERTIES
+  COMPILE_OPTIONS "--prec-div=true;--prec-sqrt=true;--ftz=false")
 target_link_libraries(rwkv7_train PRIVATE rwkv_pth CUDA::cudart CUDA::cublas)
 if(RWKV_NCCL)
   find_path(NCCL_INCLUDE_DIR nccl.h)

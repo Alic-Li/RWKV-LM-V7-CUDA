@@ -1,5 +1,6 @@
 #pragma once
 #include "gpu.hpp"
+#include "adamw.hpp"
 #include "weights.hpp"
 #include <cuda_runtime_api.h>
 #include <memory>
@@ -12,10 +13,6 @@ struct MicroBatch {
   std::vector<float, PinnedAllocator<float>> losses;
 };
 
-struct Adam {
-  float lr, beta1, beta2, eps, decay, clip;
-};
-
 class Model {
 public:
   Model(int device, const Checkpoint &input, const Shape &shape,
@@ -26,10 +23,10 @@ public:
   void activate() const;
   cudaStream_t stream() const;
   void synchronize() const;
-  float *gradients();
+  float *gradients() const;
   std::size_t parameter_count() const;
-  void clear_gradients();
-  void accumulate(MicroBatch &batch, float inv_tokens);
+  void clear_gradients(bool accumulate_microbatches);
+  void accumulate(MicroBatch &batch, std::size_t total_targets);
   float gradient_scale(float clip) const;
   void update(const Adam &opt, std::uint64_t step, float scale);
   void save(const std::string &path) const;

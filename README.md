@@ -28,11 +28,11 @@ mkdir -p out
   --lr 6e-4 --lr-final 1e-5 --warmup 10 --devices 0
 ```
 
-已有 x070 权重时可以直接运行训练程序。初始化沿用原项目 x070 模型的参数形状、层相关常量和正交初始化增益。随机数序列由 C++ 的种子控制。Head size 固定为 64，默认 FFN 宽度为 embedding 宽度的 4 倍，默认词表大小为 65536。训练支持 PyTorch ZIP 格式中的 BF16、FP16 和 FP32 输入权重，计算使用 BF16 激活以及 FP32 参数梯度累积、主权重和 AdamW 状态。
+已有 x070 权重时可以直接运行训练程序。初始化沿用原项目 x070 模型的参数形状、层相关常量和正交初始化增益。随机数序列由 C++ 的种子控制。Head size 固定为 64，默认 FFN 宽度为 embedding 宽度的 4 倍，默认词表大小为 65536。训练支持 PyTorch ZIP 格式中的 BF16、FP16 和 FP32 输入权重，激活为 BF16。每次反传的参数梯度先按 BF16 舍入，再以 FP32 跨 microbatch 累加、跨卡求和。梯度裁剪作用于归约后的梯度，主权重和 AdamW 矩状态均为 FP32。
 
-`--batch` 是每卡的 microbatch 大小，`--accum` 是每次更新的 microbatch 数。`--ctx` 是窗口上限，须为 16 的倍数。默认重新计算各层激活，可用 `--activation-checkpoint 0` 保留激活，用 `--head-chunk` 控制单次计算的有效目标行数，用 `--wkv-v3 1` 切换 WKV v3。每个 microbatch 的有效长度按目标位置对齐到 16。
+`--batch` 是每卡的 microbatch 大小，`--accum` 是每次更新的 microbatch 数。`--ctx` 是窗口上限，须为 16 的倍数。默认重新计算各层激活，可用 `--activation-checkpoint 0` 保留激活，用 `--head-chunk` 控制单次计算的有效目标行数，用 `--wkv-v3 1` 切换 WKV v3。每个 microbatch 的有效长度按目标位置对齐到 16。关闭激活重算时，tanh 和 sigmoid 的反传沿用原项目 TorchScript 预热后的 FP32 融合计算顺序。
 
-`--devices 0,1` 使用单机 NCCL 数据并行，每卡持有完整模型和优化器状态。交叉熵与 L2Wrap 梯度统一除以全卡和梯度累积期间的有效目标数，再通过 NCCL 对梯度求和。只由首卡写出 `rwkv-<step>.pth`。脚本参数 `EPOCH_SAVE` 对应 `--epoch-save`，默认为 1。保存周期沿用原项目从 0 开始的本次训练轮号。例如设为 2 时，进度条上第 1、3、5 轮结束时保存。设为 0 时仅在训练结束时保存。最后不足一轮也保存。已存在的输出目录会为新训练创建独立子目录。继续训练时可用 `--start-step` 延续步号与 warmup 进度，用上一条日志的 `next_window` 设置 `--start-window` 以续接取样位置。权重文件只保存模型参数，重新加载会重新创建 AdamW 状态。
+`--devices 0,1` 使用单机 NCCL 数据并行，每卡持有完整模型和优化器状态。每个 microbatch 先按本地有效目标数计算平均损失，输出头反传后按本地目标数占本次更新总有效目标数的比例缩放梯度，再累积并通过 NCCL 求和。只由首卡写出 `rwkv-<step>.pth`。脚本参数 `EPOCH_SAVE` 对应 `--epoch-save`，默认为 1。保存周期沿用原项目从 0 开始的本次训练轮号。例如设为 2 时，进度条上第 1、3、5 轮结束时保存。设为 0 时仅在训练结束时保存。最后不足一轮也保存。已存在的输出目录会为新训练创建独立子目录。继续训练时可用 `--start-step` 延续步号与 warmup 进度，用上一条日志的 `next_window` 设置 `--start-window` 以续接取样位置。权重文件只保存模型参数，重新加载会重新创建 AdamW 状态。
 
 ## 数据掩码
 
