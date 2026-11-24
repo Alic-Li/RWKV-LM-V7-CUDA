@@ -56,3 +56,14 @@ JSONL 与 `rwkv_lightning_cuda` 的文本约定一致。每行是独立文档，
 训练使用 binidx 中的文档边界。超过上下文长度的文档会拆成相邻窗口，窗口间复用一个重叠 token 保持目标对齐，递归状态按窗口重置。文档首 token 和填充位置不贡献损失。
 
 `pretrain/compat` 中的 PTH 读取、JSONL 解析和 tokenizer 实现来自本地的 `rwkv_lightning_cuda` 参考项目，构建自身无需访问该项目。
+
+## HIP 算子库
+
+`hip/` 提供与 CUDA 训练路径对应的 9 个 HIP 源文件。原生 C++ 接口位于 `hip/rwkv7_training_ops.hpp`，由调用方传入 HIP stream 和设备缓冲区。安装 ROCm 后，可从项目根目录按目标 GPU 架构单独构建静态库，例如 MI300 使用以下命令。
+
+```bash
+cmake -S hip -B build-hip -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_ARCHITECTURES=gfx942
+cmake --build build-hip
+```
+
+根目录的初始化与训练程序使用 NVIDIA CUDA 后端。HIP 构建目标为算子库 `rwkv7_hip_ops`。
