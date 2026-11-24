@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
@@ -407,11 +408,19 @@ void run(Config c) {
     auto opt = c.adam;
     opt.lr = learning_rate(c, step - 1);
     if (valid) {
-      for (auto &model : models)
-        model->clear_gradients();
       const float inv_tokens = 1.f / valid;
-      for (std::size_t i = 0; i < micro.size(); ++i)
-        models[i % models.size()]->accumulate(micro[i], inv_tokens);
+      auto accumulate_rank = [&](std::size_t rank) {
+        auto &model = *models[rank];
+        model.clear_gradients();
+        for (std::size_t i = rank; i < micro.size(); i += models.size())
+          model.accumulate(micro[i], inv_tokens);
+      };
+      std::vector<std::future<void>> workers;
+      for (std::size_t rank = 1; rank < models.size(); ++rank)
+        workers.push_back(std::async(std::launch::async, accumulate_rank, rank));
+      accumulate_rank(0);
+      for (auto &worker : workers)
+        worker.get();
       dp.sum(models, c.bucket_mib * (1024 * 1024 / sizeof(float)));
       dp.synchronize(models);
 

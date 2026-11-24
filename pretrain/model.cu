@@ -475,7 +475,7 @@ struct Model::Impl {
                   stream()>>>(x, p.g, rows, c);
   }
   BlockCache forward_block(const BF *x, BF *first,
-                           const BlockWeights &p) const {
+                           const BlockWeights &p, bool need_output) const {
     BlockCache f;
     f.ln1 = normalize(x, p.ln1);
     BF *mixed[6], *mix_w[6];
@@ -531,6 +531,8 @@ struct Model::Impl {
          f.ffn_mix.get());
     f.ffn_act = linear(f.ffn_mix.get(), p.ffn_key, c, ffn);
     relu_square(stream(), Count(rows) * ffn, f.ffn_act.get());
+    if (!need_output)
+      return f;
     const auto ffn_y = linear(f.ffn_act.get(), p.ffn_value, ffn, c);
     f.output = bf_buffer(n);
     add<<<grid(n), threads, 0, stream()>>>(f.middle.get(), ffn_y.get(),
@@ -707,7 +709,7 @@ void Model::accumulate(MicroBatch &batch, float inv_tokens) {
     saved.reserve(m.blocks.size());
   Buffer<BF> first;
   for (const auto &block : m.blocks) {
-    auto f = m.forward_block(residuals.back().get(), first.get(), block);
+    auto f = m.forward_block(residuals.back().get(), first.get(), block, true);
     if (!first.get())
       first = std::move(f.raw_v);
     residuals.push_back(std::move(f.output));
@@ -753,7 +755,7 @@ void Model::accumulate(MicroBatch &batch, float inv_tokens) {
     auto *x = residuals[layer].get();
     residuals.pop_back();
     auto f =
-        m.checkpoint ? m.forward_block(x, base, p) : std::move(saved[layer]);
+        m.checkpoint ? m.forward_block(x, base, p, false) : std::move(saved[layer]);
     if (!m.checkpoint && !layer)
       f.raw_v = std::move(first);
     dy = m.backward_block(x, dy.get(), base, d_first.get(), f, p);
