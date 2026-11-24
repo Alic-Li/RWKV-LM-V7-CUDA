@@ -8,7 +8,7 @@
 #endif
 #include <algorithm>
 #include <chrono>
-#include <cstring>
+#include <tuple>
 #include <filesystem>
 #include <future>
 #include <iomanip>
@@ -28,7 +28,7 @@ struct Config {
   std::string input, dataset, mask, tokenizer, output;
   std::vector<int> devices;
   int context, batch, accum, head_chunk;
-  Index steps, bucket_mib, warmup, start_step, start_window, seed;
+  Index steps, epoch_save, bucket_mib, warmup, start_step, start_window, seed;
   bool optimized_wkv, checkpoint_activations;
   Adam adam;
   float final_lr;
@@ -71,6 +71,7 @@ Config config(int argc, char **argv) {
   c.head_chunk = options.number("--head-chunk", 128);
   const auto steps = options.take("--steps");
   c.steps = steps.empty() ? 0 : integer<Index>(steps);
+  c.epoch_save = options.number<Index>("--epoch-save", 1);
   c.bucket_mib = options.number<Index>("--nccl-bucket-mb", 25);
   if (!c.bucket_mib || c.bucket_mib > SIZE_MAX / (1024 * 1024))
     throw std::invalid_argument("invalid NCCL bucket size");
@@ -243,44 +244,75 @@ private:
 #endif
 };
 
-void fill_batch(MicroBatch &batch, std::vector<std::int64_t> &labels,
-                const Dataset &data, Sampler &sampler, const Config &c,
-                int lanes) {
-  const int rows = c.batch * c.context;
-  batch.input.resize(rows);
-  batch.lanes = 0;
-  batch.time = 0;
-  batch.active_rows.clear();
-  batch.labels.clear();
-  batch.losses.clear();
-  batch.active_rows.reserve(rows);
-  batch.labels.reserve(rows);
-  batch.losses.reserve(rows);
-  for (int lane = 0; lane < lanes; ++lane) {
-    const int off = batch.lanes * c.context;
-    data.sample(sampler.next(), batch.input.data() + off, labels.data());
-    int last = 0;
+struct Lane {
+  std::vector<int> input;
+  std::vector<std::int64_t> labels;
+  int time = 0, targets = 0;
+};
+
+// Assign whole sequences within one global microbatch. Keep causal order within
+// each sequence and keep the sampler cursor independent of the rank mapping.
+void fill_ranks(MicroBatch *ranks, std::vector<Lane> &lanes, const Dataset &data,
+                Sampler &sampler, const Config &c, std::size_t count) {
+  const auto devices = c.devices.size();
+  std::vector<std::size_t> active;
+  for (std::size_t i = 0; i < count; ++i) {
+    auto &lane = lanes[i];
+    lane.input.resize(c.context);
+    lane.labels.resize(c.context);
+    data.sample(sampler.next(), lane.input.data(), lane.labels.data());
+    lane.time = lane.targets = 0;
     for (int t = 0; t < c.context; ++t) {
-      if (labels[t] >= 0) {
-        batch.active_rows.push_back(off + t);
-        batch.labels.push_back(labels[t]);
-        last = t + 1;
+      if (lane.labels[t] >= 0) {
+        lane.time = t + 1;
+        ++lane.targets;
       }
     }
-    if (last) {
-      ++batch.lanes;
-      batch.time = std::max(batch.time, last);
-    }
+    if (lane.targets)
+      active.push_back(i);
   }
-  batch.time = (batch.time + 15) / 16 * 16;
-  // Causality allows us to omit the suffix after every lane's last target.
-  if (batch.time < c.context) {
-    for (int lane = 1; lane < batch.lanes; ++lane)
-      std::memmove(batch.input.data() + lane * batch.time,
-                   batch.input.data() + lane * c.context,
-                   batch.time * sizeof(int));
-    for (int &row : batch.active_rows)
-      row -= (row / c.context) * (c.context - batch.time);
+  if (devices > 1)
+    std::stable_sort(active.begin(), active.end(), [&](auto a, auto b) {
+      return std::tie(lanes[a].time, lanes[a].targets) >
+             std::tie(lanes[b].time, lanes[b].targets);
+    });
+  std::vector<std::vector<std::size_t>> assigned(devices);
+  std::vector<int> targets(devices);
+  for (auto i : active) {
+    std::size_t rank = 0;
+    for (std::size_t r = 1; r < devices; ++r)
+      if (std::make_pair(assigned[r].size(), targets[r]) <
+          std::make_pair(assigned[rank].size(), targets[rank]))
+        rank = r;
+    assigned[rank].push_back(i);
+    targets[rank] += lanes[i].targets;
+  }
+  for (std::size_t r = 0; r < devices; ++r) {
+    auto &batch = ranks[r];
+    batch.lanes = assigned[r].size();
+    batch.time = 0;
+    for (auto i : assigned[r])
+      batch.time = std::max(batch.time, lanes[i].time);
+    batch.time = (batch.time + 15) / 16 * 16;
+    batch.input.resize(batch.lanes * batch.time);
+    batch.active_rows.clear();
+    batch.labels.clear();
+    batch.losses.clear();
+    batch.active_rows.reserve(targets[r]);
+    batch.labels.reserve(targets[r]);
+    batch.losses.reserve(targets[r]);
+    int offset = 0;
+    for (auto i : assigned[r]) {
+      const auto &lane = lanes[i];
+      std::copy_n(lane.input.begin(), batch.time, batch.input.begin() + offset);
+      for (int t = 0; t < lane.time; ++t) {
+        if (lane.labels[t] >= 0) {
+          batch.active_rows.push_back(offset + t);
+          batch.labels.push_back(lane.labels[t]);
+        }
+      }
+      offset += batch.time;
+    }
   }
 }
 
@@ -370,14 +402,15 @@ void run(Config c) {
             << " windows=" << data.size() << " global_batch=" << global_batch
             << " ctx=" << c.context << " micro_batch=" << c.batch
             << " accum=" << c.accum << " planned_steps=" << c.steps
-            << " mini_epochs=" << epochs
+            << " epoch_save=" << c.epoch_save << " mini_epochs=" << epochs
             << " steps_per_full_mini_epoch=" << normal_steps
             << " start_window=" << c.start_window
             << " output=" << output.string()
             << " mini_epoch_windows=" << epoch_windows
             << " nccl_bucket_mib=" << c.bucket_mib
             << " devices=" << models.size() << '\n';
-  std::vector<std::int64_t> labels(c.context);
+  const auto rank_capacity = c.devices.size() * c.batch;
+  std::vector<Lane> lanes(rank_capacity);
   const bool interactive = isatty(STDOUT_FILENO);
   Index updates = 0;
   double epoch_seconds = 0;
@@ -397,12 +430,13 @@ void run(Config c) {
       length = offset + (c.steps - completed) * global_batch;
     Index pending =
         std::min(global_batch, length - (initial_window - epoch_start));
-    for (auto &batch : micro) {
-      const int lanes = static_cast<int>(std::min<Index>(pending, c.batch));
-      fill_batch(batch, labels, data, sampler, c, lanes);
-      valid += batch.labels.size();
-      pending -= lanes;
+    for (std::size_t i = 0; i < micro.size(); i += models.size()) {
+      const auto count = std::min<Index>(rank_capacity, pending);
+      fill_ranks(micro.data() + i, lanes, data, sampler, c, count);
+      pending -= count;
     }
+    for (const auto &batch : micro)
+      valid += batch.labels.size();
 
     double loss = 0;
     auto opt = c.adam;
@@ -472,7 +506,8 @@ void run(Config c) {
         std::cout << '\n';
       std::cout << std::flush;
     }
-    if (finished) {
+    if (completed == c.steps ||
+        (finished && c.epoch_save && (epoch - first_epoch) % c.epoch_save == 0)) {
       const auto path = output / ("rwkv-" + std::to_string(step) + ".pth");
       models.front()->save(path.string());
       std::cout << "saved=" << path.string() << " step=" << step
@@ -497,7 +532,7 @@ int main(int argc, char **argv) try {
                  "        --activation-checkpoint 0|1 --wkv-v3 0|1\n"
                  "  AdamW: --lr X --lr-final X --warmup N --beta1 X --beta2 X\n"
                  "         --weight-decay X --adam-eps X --clip X\n"
-                 "  Weights: --start-step N\n";
+                 "  Weights: --start-step N --epoch-save N\n";
     return argc == 1 ? 1 : 0;
   }
   rwkv::run(rwkv::config(argc, argv));

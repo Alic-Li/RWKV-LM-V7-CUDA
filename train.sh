@@ -8,11 +8,12 @@ CTX_LEN=512
 M_BSZ=16
 GRAD_ACCUM=1
 GRAD_CP=1
-HEAD_CHUNK=512
+HEAD_CHUNK=65536
 LR_INIT=6e-4
 LR_FINAL=6e-4
 WARMUP_STEPS=10
 NCCL_BUCKET_MB=25                    # 每个 FP32 梯度通信桶的大小（MiB）
+EPOCH_SAVE=1
 TRAIN_STEPS=""                       # 留空遍历全部窗口一次
 
 # 训练
@@ -21,4 +22,4 @@ TRAIN_STEPS=""                       # 留空遍历全部窗口一次
     --ctx "$CTX_LEN" --batch "$M_BSZ" --accum "$GRAD_ACCUM" \
     --activation-checkpoint "$GRAD_CP" --head-chunk "$HEAD_CHUNK" \
     --lr "$LR_INIT" --lr-final "$LR_FINAL" --warmup "$WARMUP_STEPS" \
-    --nccl-bucket-mb "$NCCL_BUCKET_MB" --steps "$TRAIN_STEPS"
+    --nccl-bucket-mb "$NCCL_BUCKET_MB" --steps "$TRAIN_STEPS" --epoch-save "$EPOCH_SAVE"
