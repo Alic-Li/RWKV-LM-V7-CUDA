@@ -8,6 +8,6 @@ DEVICE=0
 INIT_PTH="rwkv-init.pth"
 
 # 初始化权重
-./build/rwkv7_init "$INIT_PTH" \
+"${BUILD_DIR:-./build}/rwkv7_init" "$INIT_PTH" \
     --layers "$N_LAYER" --channels "$N_EMBD" --vocab "$VOCAB_SIZE" \
     --seed "$SEED" --device "$DEVICE"

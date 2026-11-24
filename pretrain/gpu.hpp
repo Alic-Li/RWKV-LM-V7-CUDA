@@ -26,7 +26,7 @@ template <class T> struct PinnedAllocator {
     CUDA(cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocPortable));
     return p;
   }
-  void deallocate(T *p, std::size_t) { cudaFreeHost(p); }
+  void deallocate(T *p, std::size_t) { (void)cudaFreeHost(p); }
   template <class U> bool operator==(const PinnedAllocator<U> &) const {
     return true;
   }
@@ -44,7 +44,7 @@ public:
   }
   ~Buffer() {
     if (ptr_)
-      cudaFreeAsync(ptr_, stream_);
+      (void)cudaFreeAsync(ptr_, stream_);
   }
   Buffer(const Buffer &) = delete;
   Buffer &operator=(const Buffer &) = delete;

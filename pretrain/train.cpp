@@ -158,7 +158,7 @@ public:
       nccl_ok(result);
     }
 #else
-    throw std::runtime_error("multi-GPU training requires a build with NCCL");
+    throw std::runtime_error("multi-GPU training requires a build with NCCL or RCCL");
 #endif
   }
 
@@ -335,7 +335,7 @@ void run(Config c) {
   // WKV uses int indices. TimeMix backward tiles eight rows per grid.y block.
   if (rows > INT32_MAX / std::uint64_t(shape.channels) || rows > 65535 * 8ULL)
     throw std::invalid_argument(
-        "batch and context exceed the CUDA kernel indexing range");
+        "batch and context exceed the GPU kernel indexing range");
   const Dataset data(c.dataset, c.mask, c.tokenizer, c.context, shape.vocab);
   constexpr Index epoch_windows = 40320;
   const Index global_batch = Index(c.batch) * c.devices.size() * c.accum;
@@ -361,13 +361,15 @@ void run(Config c) {
   CUDA(cudaGetDeviceCount(&device_count));
   for (int id : c.devices) {
     if (id >= device_count)
-      throw std::invalid_argument("CUDA device is not visible: " +
+      throw std::invalid_argument("GPU device is not visible: " +
                                   std::to_string(id));
+#ifndef RWKV_ROCM
     cudaDeviceProp prop;
     CUDA(cudaGetDeviceProperties(&prop, id));
     if (prop.major < 8)
       throw std::invalid_argument(
           "BF16 training requires CUDA compute capability 8.0 or newer");
+#endif
   }
   // Reserve a fresh output directory before training so older checkpoints
   // cannot collide with a save several hundred steps later.
@@ -527,7 +529,7 @@ int main(int argc, char **argv) try {
                  "[--steps N] [--nccl-bucket-mb MiB] [options]\n"
                  "  Data: --mask PATH --tokenizer PATH --ctx N --seed N "
                  "--start-window N\n"
-                 "  CUDA: --devices 0,1 --batch N --accum N --head-chunk N\n"
+                 "  GPU: --devices 0,1 --batch N --accum N --head-chunk N\n"
                  "        --activation-checkpoint 0|1 --wkv-v3 0|1\n"
                  "  AdamW: --lr X --lr-final X --warmup N --beta1 X --beta2 X\n"
                  "         --weight-decay X --adam-eps X --clip X\n"

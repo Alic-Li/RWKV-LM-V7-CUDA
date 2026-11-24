@@ -16,6 +16,19 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build
 ```
 
+### AMD ROCm
+
+在 AMD Instinct MI250 上，安装 ROCm、hipBLAS、hipSOLVER、hipCUB 和 libarchive 开发包后，从项目根目录编译初始化和训练程序。多卡训练需要 RCCL，CMake 会自动检测。
+
+```bash
+cmake -S . -B build-rocm -DCMAKE_BUILD_TYPE=Release \
+  -DRWKV_ROCM=ON -DCMAKE_HIP_ARCHITECTURES=gfx90a \
+  -DCMAKE_PREFIX_PATH=/opt/rocm
+cmake --build build-rocm --parallel
+```
+
+以下示例在 ROCm 上使用 `./build-rocm/rwkv7_init` 和 `./build-rocm/rwkv7_train`。运行脚本时可用 `BUILD_DIR=build-rocm` 指定同一目录。
+
 ## 初始化与训练
 
 ```bash
@@ -68,7 +81,7 @@ cmake -S hip -B build-hip -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_ARCHITECTURES=g
 cmake --build build-hip
 ```
 
-根目录的初始化与训练程序使用 NVIDIA CUDA 后端。HIP 构建目标为算子库 `rwkv7_hip_ops`。
+根目录启用 `RWKV_ROCM` 后，训练程序链接同一个 `rwkv7_hip_ops` 算子库。
 
 
 每个完整 mini epoch 读取 40320 个上下文窗口，与 RWKV-LM-V7 的样本数一致。全局批大小为每卡 batch × GPU 数 × 梯度累积次数。在 `train.sh` 中将 `TRAIN_STEPS` 留空，训练器会根据数据索引和全局批大小计算步数，读到本次数据遍历结束。mini epoch 边界和数据尾部均可使用不足一批的窗口。全掩码批计入数据进度，跳过 AdamW 更新。填写正整数可指定批次数，允许跨数据遍历循环取样。`NCCL_BUCKET_MB` 以 MiB 设置每次 NCCL FP32 梯度求和的最大通信量。

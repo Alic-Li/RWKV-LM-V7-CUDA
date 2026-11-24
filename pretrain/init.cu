@@ -12,7 +12,7 @@ namespace rwkv {
 namespace {
 void solver_ok(cusolverStatus_t result) {
   if (result != CUSOLVER_STATUS_SUCCESS)
-    throw std::runtime_error("cuSOLVER QR failed with status " +
+    throw std::runtime_error("GPU QR solver failed with status " +
                              std::to_string(result));
 }
 

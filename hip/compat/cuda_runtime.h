@@ -1,0 +1,35 @@
+#pragma once
+#include <hip/hip_runtime.h>
+
+using cudaError_t = hipError_t;
+using cudaDeviceProp = hipDeviceProp_t;
+using cudaMemPool_t = hipMemPool_t;
+using cudaStream_t = hipStream_t;
+
+#define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaDeviceGetDefaultMemPool hipDeviceGetDefaultMemPool
+#define cudaErrorNotReady hipErrorNotReady
+#define cudaFreeAsync hipFreeAsync
+#define cudaFreeHost hipHostFree
+#define cudaGetDevice hipGetDevice
+#define cudaGetDeviceCount hipGetDeviceCount
+#define cudaGetDeviceProperties hipGetDeviceProperties
+#define cudaGetErrorString hipGetErrorString
+#define cudaGetLastError hipGetLastError
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocPortable hipHostMallocPortable
+#define cudaMallocAsync hipMallocAsync
+#define cudaMemPoolAttrReleaseThreshold hipMemPoolAttrReleaseThreshold
+#define cudaMemPoolSetAttribute hipMemPoolSetAttribute
+#define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemsetAsync hipMemsetAsync
+#define cudaSetDevice hipSetDevice
+#define cudaStreamCreateWithFlags hipStreamCreateWithFlags
+#define cudaStreamDestroy hipStreamDestroy
+#define cudaStreamNonBlocking hipStreamNonBlocking
+#define cudaStreamQuery hipStreamQuery
+#define cudaStreamSynchronize hipStreamSynchronize
+#define cudaSuccess hipSuccess

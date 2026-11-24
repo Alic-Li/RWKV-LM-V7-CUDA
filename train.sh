@@ -17,7 +17,7 @@ EPOCH_SAVE=1
 TRAIN_STEPS=""                       # 留空遍历全部窗口一次
 
 # 训练
-./build/rwkv7_train "$INPUT_PTH" \
+"${BUILD_DIR:-./build}/rwkv7_train" "$INPUT_PTH" \
     --dataset "$DATA_FILE" --out "$OUT_DIR" --devices "$DEVICES" \
     --ctx "$CTX_LEN" --batch "$M_BSZ" --accum "$GRAD_ACCUM" \
     --activation-checkpoint "$GRAD_CP" --head-chunk "$HEAD_CHUNK" \

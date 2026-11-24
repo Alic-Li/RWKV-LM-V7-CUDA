@@ -7,6 +7,23 @@ namespace {
 // Match ATen's vectorized CUDA LayerNorm reduction tree (four warps,
 // four consecutive channels per lane). Model widths are multiples of 64.
 constexpr int row_threads = 128;
+template <typename T>
+__device__ T shuffle_down_32(T value, int step) {
+#ifdef RWKV_ROCM
+  return __shfl_down(value, step, 32);
+#else
+  return __shfl_down_sync(0xffffffff, value, step);
+#endif
+}
+
+__device__ float shuffle_xor_32(float value, int step) {
+#ifdef RWKV_ROCM
+  return __shfl_xor(value, step, 32);
+#else
+  return __shfl_xor_sync(0xffffffff, value, step);
+#endif
+}
+
 struct Moments {
   float mean, m2, count;
 };
@@ -46,9 +63,9 @@ __global__ void normalize_rows(int width, const BF *input, const BF *residual,
     }
   }
   for (int step = 16; step; step /= 2) {
-    Moments other{__shfl_down_sync(0xffffffff, local.mean, step),
-                  __shfl_down_sync(0xffffffff, local.m2, step),
-                  __shfl_down_sync(0xffffffff, local.count, step)};
+    Moments other{shuffle_down_32(local.mean, step),
+                  shuffle_down_32(local.m2, step),
+                  shuffle_down_32(local.count, step)};
     local = merge(local, other);
   }
   if (tid % 32 == 0)
@@ -70,7 +87,7 @@ __global__ void normalize_rows(int width, const BF *input, const BF *residual,
 
 __device__ float warp_sum(float value) {
   for (int step = 16; step; step /= 2)
-    value += __shfl_down_sync(0xffffffff, value, step);
+    value += shuffle_down_32(value, step);
   return value;
 }
 
@@ -137,8 +154,8 @@ __global__ void affine_gradient(int rows, int width, const BF *x, const BF *dy,
     w = lane < blockDim.y ? weights[lane][channel] : 0.f;
     b = lane < blockDim.y ? biases[lane][channel] : 0.f;
     for (int step = blockDim.y / 2; step; step /= 2) {
-      w += __shfl_xor_sync(0xffffffff, w, step);
-      b += __shfl_xor_sync(0xffffffff, b, step);
+      w += shuffle_xor_32(w, step);
+      b += shuffle_xor_32(b, step);
     }
     if (lane == 0) {
       // Autograd returns BF16 parameter gradients before FP32 accumulation.

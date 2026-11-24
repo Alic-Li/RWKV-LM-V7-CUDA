@@ -4,7 +4,11 @@
 #include "embedding.hpp"
 #include "gradient_norm.hpp"
 
+#ifdef RWKV_ROCM
+#include "../hip/rwkv7_training_ops.hpp"
+#else
 #include "rwkv7_training_ops.hpp"
+#endif
 #include "gpu.hpp"
 #include <algorithm>
 #include <array>
@@ -13,6 +17,28 @@
 #include <unordered_map>
 
 namespace rwkv {
+#ifdef RWKV_ROCM
+using hip_ops::alpha;
+using hip_ops::alpha_backward;
+using hip_ops::alpha_tiles;
+using hip_ops::cmix;
+using hip_ops::cmix_backward;
+using hip_ops::head_loss;
+using hip_ops::key_prepare;
+using hip_ops::key_prepare_backward;
+using hip_ops::mix6;
+using hip_ops::mix6_backward;
+using hip_ops::norm_gate;
+using hip_ops::norm_gate_backward;
+using hip_ops::relu_square;
+using hip_ops::relu_square_backward;
+using hip_ops::value_gate;
+using hip_ops::value_gate_backward;
+using hip_ops::wkv_backward;
+using hip_ops::wkv_backward_v3;
+using hip_ops::wkv_forward;
+using hip_ops::wkv_forward_v3;
+#endif
 namespace {
 constexpr int threads = 256;
 using Count = std::size_t;
@@ -37,18 +63,18 @@ struct Device {
     } catch (...) {
       if (blas)
         cublasDestroy(blas);
-      cudaStreamDestroy(stream);
+      (void)cudaStreamDestroy(stream);
       throw;
     }
   }
   ~Device() {
-    cudaStreamSynchronize(stream);
+    (void)cudaStreamSynchronize(stream);
     cublasDestroy(blas);
-    cudaStreamDestroy(stream);
+    (void)cudaStreamDestroy(stream);
   }
   static void blas_ok(cublasStatus_t status) {
     if (status != CUBLAS_STATUS_SUCCESS)
-      throw std::runtime_error(std::string("cuBLAS: ") +
+      throw std::runtime_error(std::string("GPU BLAS: ") +
                                cublasGetStatusString(status));
   }
   int id, resident_threads;
@@ -548,7 +574,7 @@ Model::Model(int id, const Checkpoint &input, const Shape &s,
     : impl_(std::make_unique<Impl>(id, input, s, layout, head_chunk,
                                    optimized_wkv, checkpoint_activations)) {}
 Model::~Model() {
-  cudaSetDevice(impl_->gpu.id);
+  (void)cudaSetDevice(impl_->gpu.id);
   impl_.reset();
 }
 void Model::activate() const { CUDA(cudaSetDevice(impl_->gpu.id)); }

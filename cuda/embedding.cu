@@ -1,16 +1,27 @@
 #include "embedding.hpp"
 #include "gpu.hpp"
+#ifdef RWKV_ROCM
+#include <hipcub/device/device_radix_sort.hpp>
+#else
 #include <cub/device/device_radix_sort.cuh>
+#endif
 
 namespace rwkv {
 namespace {
+#ifdef RWKV_ROCM
+using hipcub::DeviceRadixSort;
+#else
+using cub::DeviceRadixSort;
+#endif
+constexpr int channels_per_tile = 32;
+
 __global__ void row_numbers(int *positions, int rows) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < rows)
     positions[i] = i;
 }
 
-// Stable sorting keeps contributions to a token in input order. Each warp
+// Stable sorting keeps contributions to a token in input order. Each thread group
 // owns a token and channel tile, so repeated indices never race.
 template <bool small>
 __global__ void reduce_tokens(const int *tokens, const int *positions,
@@ -19,7 +30,7 @@ __global__ void reduce_tokens(const int *tokens, const int *positions,
   const int begin = blockIdx.x * blockDim.y + threadIdx.y;
   if (begin >= rows || (begin && tokens[begin - 1] == tokens[begin]))
     return;
-  const int channel = blockIdx.y * warpSize + threadIdx.x;
+  const int channel = blockIdx.y * channels_per_tile + threadIdx.x;
   if (channel >= channels)
     return;
   const int token = tokens[begin];
@@ -57,15 +68,15 @@ void embedding_gradient(cudaStream_t stream, int rows, int channels,
   row_numbers<<<(rows - 1) / 256 + 1, 256, 0, stream>>>(indices.get(), rows);
   std::size_t bytes = 0;
   auto sort = [&](void *scratch) {
-    CUDA(cub::DeviceRadixSort::SortPairs(scratch, bytes, tokens, sorted.get(),
+    CUDA(DeviceRadixSort::SortPairs(scratch, bytes, tokens, sorted.get(),
                                          indices.get(), positions.get(), rows,
                                          0, 31, stream));
   };
   sort(nullptr);
   Buffer<unsigned char> scratch(stream, bytes);
   sort(scratch.get());
-  const dim3 blocks((rows - 1) / 8 + 1, (channels - 1) / 32 + 1);
-  const dim3 threads(32, 8);
+  const dim3 blocks((rows - 1) / 8 + 1, (channels - 1) / channels_per_tile + 1);
+  const dim3 threads(channels_per_tile, 8);
   if (rows <= 3072)
     reduce_tokens<true><<<blocks, threads, 0, stream>>>(
         sorted.get(), positions.get(), upstream, gradient, rows, channels);

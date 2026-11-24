@@ -18,10 +18,15 @@ __device__ float block_sum(float value) {
       scratch[lane] = value;
     }
   }
-  if (lane < warpSize) {
+  if (lane < 32) {
+#ifdef RWKV_ROCM
+    for (unsigned stride = min(blockDim.x, 32u) / 2; stride; stride /= 2)
+      value += __shfl_down(value, stride, 32);
+#else
     const unsigned mask = __activemask();
     for (unsigned stride = min(blockDim.x, 32u) / 2; stride; stride /= 2)
       value += __shfl_down_sync(mask, value, stride);
+#endif
   }
   return value;
 }
