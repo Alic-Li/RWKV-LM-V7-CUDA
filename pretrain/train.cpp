@@ -14,7 +14,10 @@
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <sstream>
+#include <sys/ioctl.h>
 #include <thread>
+#include <unistd.h>
 
 namespace rwkv {
 namespace {
@@ -24,7 +27,7 @@ struct Config {
   std::string input, dataset, mask, tokenizer, output;
   std::vector<int> devices;
   int context, batch, accum, head_chunk;
-  Index steps, save_every, warmup, start_step, start_window, seed;
+  Index steps, bucket_mib, warmup, start_step, start_window, seed;
   bool optimized_wkv, checkpoint_activations;
   Adam adam;
   float final_lr;
@@ -65,8 +68,11 @@ Config config(int argc, char **argv) {
   c.batch = options.number("--batch", 1);
   c.accum = options.number("--accum", 1);
   c.head_chunk = options.number("--head-chunk", 128);
-  c.steps = options.number<Index>("--steps", 0);
-  c.save_every = options.number<Index>("--save-every", 0);
+  const auto steps = options.take("--steps");
+  c.steps = steps.empty() ? 0 : integer<Index>(steps);
+  c.bucket_mib = options.number<Index>("--nccl-bucket-mb", 25);
+  if (!c.bucket_mib || c.bucket_mib > SIZE_MAX / (1024 * 1024))
+    throw std::invalid_argument("invalid NCCL bucket size");
   c.warmup = options.number<Index>("--warmup", 0);
   c.start_step = options.number<Index>("--start-step", 0);
   c.start_window = options.number<Index>("--start-window", 0);
@@ -81,9 +87,8 @@ Config config(int argc, char **argv) {
             float(options.real("--clip", 1))};
   c.final_lr = options.real("--lr-final", c.adam.lr);
   options.finish();
-  if (c.dataset.empty() || c.output.empty() || !c.steps)
-    throw std::invalid_argument(
-        "--dataset, --out and a positive --steps are required");
+  if (c.dataset.empty() || c.output.empty())
+    throw std::invalid_argument("--dataset and --out are required");
   if (c.context < 16 || c.context % 16 || c.batch < 1 || c.batch > 65535 ||
       c.accum < 1 || c.head_chunk < 1 || c.start_step > UINT64_MAX - c.steps)
     throw std::invalid_argument(
@@ -165,30 +170,37 @@ public:
 #endif
   }
 
-  void sum(const std::vector<std::unique_ptr<Model>> &models) {
+  void sum(const std::vector<std::unique_ptr<Model>> &models,
+           std::size_t bucket_elements) {
 #ifdef RWKV_HAVE_NCCL
     if (comms_.empty())
       return;
-    nccl_ok(ncclGroupStart());
-    ncclResult_t first_error = ncclSuccess;
-    cudaError_t cuda_status = cudaSuccess;
-    for (std::size_t i = 0; i < models.size(); ++i) {
-      cuda_status = cudaSetDevice(devices_[i]);
-      if (cuda_status != cudaSuccess)
-        break;
-      auto &m = *models[i];
-      const auto status =
-          ncclAllReduce(m.gradients(), m.gradients(), m.parameter_count(),
-                        ncclFloat32, ncclSum, comms_[i], m.stream());
-      if (first_error == ncclSuccess)
-        first_error = status;
+    const auto total = models.front()->parameter_count();
+    for (std::size_t offset = 0; offset < total;) {
+      const auto count = std::min(bucket_elements, total - offset);
+      nccl_ok(ncclGroupStart());
+      ncclResult_t first_error = ncclSuccess;
+      cudaError_t cuda_status = cudaSuccess;
+      for (std::size_t i = 0; i < models.size(); ++i) {
+        cuda_status = cudaSetDevice(devices_[i]);
+        if (cuda_status != cudaSuccess)
+          break;
+        auto &m = *models[i];
+        const auto status =
+            ncclAllReduce(m.gradients() + offset, m.gradients() + offset, count,
+                          ncclFloat32, ncclSum, comms_[i], m.stream());
+        if (first_error == ncclSuccess)
+          first_error = status;
+      }
+      const auto group_status = ncclGroupEnd();
+      CUDA(cuda_status);
+      nccl_ok(first_error);
+      nccl_ok(group_status);
+      offset += count;
     }
-    const auto group_status = ncclGroupEnd();
-    CUDA(cuda_status);
-    nccl_ok(first_error);
-    nccl_ok(group_status);
 #else
     (void)models;
+    (void)bucket_elements;
 #endif
   }
 
@@ -231,7 +243,8 @@ private:
 };
 
 void fill_batch(MicroBatch &batch, std::vector<std::int64_t> &labels,
-                const Dataset &data, Sampler &sampler, const Config &c) {
+                const Dataset &data, Sampler &sampler, const Config &c,
+                int lanes) {
   const int rows = c.batch * c.context;
   batch.input.resize(rows);
   batch.lanes = 0;
@@ -242,7 +255,7 @@ void fill_batch(MicroBatch &batch, std::vector<std::int64_t> &labels,
   batch.active_rows.reserve(rows);
   batch.labels.reserve(rows);
   batch.losses.reserve(rows);
-  for (int lane = 0; lane < c.batch; ++lane) {
+  for (int lane = 0; lane < lanes; ++lane) {
     const int off = batch.lanes * c.context;
     data.sample(sampler.next(), batch.input.data() + off, labels.data());
     int last = 0;
@@ -281,7 +294,7 @@ float learning_rate(const Config &c, Index i) {
                           (1 + std::cos(std::acos(-1.) * progress)) / 2;
 }
 
-void run(const Config &c) {
+void run(Config c) {
   const Checkpoint input(c.input);
   const auto shape = input.shape();
   const auto layout = weight_layout(shape);
@@ -291,6 +304,26 @@ void run(const Config &c) {
     throw std::invalid_argument(
         "batch and context exceed the CUDA kernel indexing range");
   const Dataset data(c.dataset, c.mask, c.tokenizer, c.context, shape.vocab);
+  constexpr Index epoch_windows = 40320;
+  const Index global_batch = Index(c.batch) * c.devices.size() * c.accum;
+  const bool full_pass = c.steps == 0;
+  // Resume an automatic run at its absolute window cursor within this pass.
+  if (full_pass && c.start_window >= data.size()) {
+    std::cout << "Dataset pass complete at window " << c.start_window << '\n';
+    return;
+  }
+  const auto ceil_div = [](Index n, Index d) { return n / d + (n % d != 0); };
+  if (full_pass) {
+    const Index remaining = data.size() - c.start_window;
+    const Index first =
+        std::min(remaining, epoch_windows - c.start_window % epoch_windows);
+    const Index rest = remaining - first;
+    c.steps = ceil_div(first, global_batch) +
+              (rest / epoch_windows) * ceil_div(epoch_windows, global_batch) +
+              ceil_div(rest % epoch_windows, global_batch);
+    if (c.steps > UINT64_MAX - c.start_step)
+      throw std::invalid_argument("step range overflow");
+  }
   int device_count;
   CUDA(cudaGetDeviceCount(&device_count));
   for (int id : c.devices) {
@@ -303,17 +336,26 @@ void run(const Config &c) {
       throw std::invalid_argument(
           "BF16 training requires CUDA compute capability 8.0 or newer");
   }
-  std::filesystem::create_directories(c.output);
-  const auto output_path = [&](Index step) {
-    return std::filesystem::path(c.output) /
-           ("rwkv-" + std::to_string(step) + ".pth");
-  };
-  const auto validate_output = [&](Index step) {
-    if (std::filesystem::exists(output_path(step)))
-      throw std::runtime_error("checkpoint already exists: " +
-                               output_path(step).string());
-  };
-  validate_output(c.start_step + c.steps);
+  // Reserve a fresh output directory before training so older checkpoints
+  // cannot collide with a save several hundred steps later.
+  std::filesystem::path output = c.output;
+  if (!std::filesystem::create_directories(output)) {
+    for (Index i = 1;; ++i) {
+      output = std::filesystem::path(c.output) / ("run-" + std::to_string(i));
+      if (std::filesystem::create_directory(output))
+        break;
+    }
+  }
+  const Index first_epoch = c.start_window / epoch_windows;
+  const Index offset_in_first = c.start_window % epoch_windows;
+  const Index first_steps =
+      ceil_div(epoch_windows - offset_in_first, global_batch);
+  const Index normal_steps = ceil_div(epoch_windows, global_batch);
+  const Index epochs =
+      full_pass ? ceil_div(data.size(), epoch_windows) - first_epoch
+                : 1 + (c.steps > first_steps
+                           ? ceil_div(c.steps - first_steps, normal_steps)
+                           : 0);
 
   std::vector<MicroBatch> micro(std::size_t(c.accum) * c.devices.size());
   std::vector<std::unique_ptr<Model>> models;
@@ -324,62 +366,112 @@ void run(const Config &c) {
                                              c.checkpoint_activations));
   Sampler sampler(data.size(), c.seed, c.start_window);
   std::cout << "parameters=" << models.front()->parameter_count()
-            << " windows=" << data.size() << " devices=" << models.size()
-            << '\n';
+            << " windows=" << data.size() << " global_batch=" << global_batch
+            << " ctx=" << c.context << " micro_batch=" << c.batch
+            << " accum=" << c.accum << " planned_steps=" << c.steps
+            << " mini_epochs=" << epochs
+            << " steps_per_full_mini_epoch=" << normal_steps
+            << " start_window=" << c.start_window
+            << " output=" << output.string()
+            << " mini_epoch_windows=" << epoch_windows
+            << " nccl_bucket_mib=" << c.bucket_mib
+            << " devices=" << models.size() << '\n';
   std::vector<std::int64_t> labels(c.context);
+  const bool interactive = isatty(STDOUT_FILENO);
+  Index updates = 0;
+  double epoch_seconds = 0;
+  Index timed_windows = 0;
   for (Index completed = 0; completed < c.steps;) {
     const auto began = std::chrono::steady_clock::now();
     const auto step = c.start_step + completed + 1;
-    const bool save =
-        (c.save_every && step % c.save_every == 0) || completed + 1 == c.steps;
-    if (save)
-      validate_output(step);
     const auto initial_window = sampler.position();
     std::size_t valid = 0;
-    do {
-      for (auto &batch : micro) {
-        fill_batch(batch, labels, data, sampler, c);
-        valid += batch.labels.size();
-      }
-      // Cover a full epoch even when this search starts partway through an
-      // epoch.
-      if (!valid && (sampler.position() - initial_window) / data.size() >= 2)
-        throw std::runtime_error("dataset has no unmasked next-token targets");
-    } while (!valid);
-
-    for (auto &model : models)
-      model->clear_gradients();
-    const float inv_tokens = 1.f / valid;
-    for (std::size_t i = 0; i < micro.size(); ++i)
-      models[i % models.size()]->accumulate(micro[i], inv_tokens);
-    dp.sum(models);
-    dp.synchronize(models);
+    const Index epoch = initial_window / epoch_windows;
+    const Index epoch_start = initial_window - initial_window % epoch_windows;
+    Index length = epoch_windows;
+    const Index offset = initial_window - epoch_start;
+    if (full_pass)
+      length = std::min(length, data.size() - epoch_start);
+    else if (c.steps - completed < ceil_div(length - offset, global_batch))
+      length = offset + (c.steps - completed) * global_batch;
+    Index pending =
+        std::min(global_batch, length - (initial_window - epoch_start));
+    for (auto &batch : micro) {
+      const int lanes = static_cast<int>(std::min<Index>(pending, c.batch));
+      fill_batch(batch, labels, data, sampler, c, lanes);
+      valid += batch.labels.size();
+      pending -= lanes;
+    }
 
     double loss = 0;
-    for (const auto &batch : micro)
-      loss = std::accumulate(batch.losses.begin(), batch.losses.end(), loss);
-    loss /= valid;
-    if (!std::isfinite(loss))
-      throw std::runtime_error("non-finite masked loss");
-
     auto opt = c.adam;
     opt.lr = learning_rate(c, step - 1);
-    const float scale = models.front()->gradient_scale(opt.clip);
-    for (auto &model : models)
-      model->update(opt, completed + 1, scale);
-    dp.synchronize(models);
+    if (valid) {
+      for (auto &model : models)
+        model->clear_gradients();
+      const float inv_tokens = 1.f / valid;
+      for (std::size_t i = 0; i < micro.size(); ++i)
+        models[i % models.size()]->accumulate(micro[i], inv_tokens);
+      dp.sum(models, c.bucket_mib * (1024 * 1024 / sizeof(float)));
+      dp.synchronize(models);
+
+      for (const auto &batch : micro)
+        loss = std::accumulate(batch.losses.begin(), batch.losses.end(), loss);
+      loss /= valid;
+      if (!std::isfinite(loss))
+        throw std::runtime_error("non-finite masked loss");
+
+      ++updates;
+      const float scale = models.front()->gradient_scale(opt.clip);
+      for (auto &model : models)
+        model->update(opt, updates, scale);
+      dp.synchronize(models);
+    }
     ++completed;
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - began)
             .count();
-    std::cout << std::setprecision(7) << "step=" << step << " loss=" << loss
-              << " lr=" << opt.lr << " targets=" << valid
-              << " targets/s=" << valid / seconds
-              << " next_window=" << sampler.position() << std::endl;
-    if (save) {
-      const auto path = output_path(step).string();
-      models.front()->save(path);
-      std::cout << "Wrote " << path << std::endl;
+    const Index progress = sampler.position() - epoch_start;
+    const bool finished = progress == length || completed == c.steps;
+    epoch_seconds += seconds;
+    timed_windows += sampler.position() - initial_window;
+    if (completed == c.steps && !updates)
+      throw std::runtime_error("no unmasked targets in remaining dataset");
+    if (interactive || finished) {
+      const int filled = static_cast<int>(24.0 * progress / length);
+      std::ostringstream line;
+      line << "mini_epoch=" << epoch - first_epoch + 1 << '/' << epochs << " ["
+           << std::string(filled, '=') << std::string(24 - filled, ' ') << "] "
+           << progress << '/' << length << " step=" << step
+           << (valid ? " loss=" : " skipped_all_masked=") << (valid ? loss : 1)
+           << " ETA="
+           << std::llround(epoch_seconds / timed_windows * (length - progress))
+           << "s lr=" << opt.lr << " targets=" << valid
+           << " targets/s=" << valid / seconds;
+      auto message = line.str();
+      if (interactive) {
+        struct winsize size{};
+        const unsigned columns =
+            ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col
+                ? size.ws_col
+                : 80;
+        message.resize(std::min(message.size(), std::size_t(columns - 1)));
+        std::cout << "\r\033[2K";
+      }
+      std::cout << message;
+      if (finished)
+        std::cout << '\n';
+      std::cout << std::flush;
+    }
+    if (finished) {
+      const auto path = output / ("rwkv-" + std::to_string(step) + ".pth");
+      models.front()->save(path.string());
+      std::cout << "saved=" << path.string() << " step=" << step
+                << " next_window=" << sampler.position() << std::endl;
+    }
+    if (finished) {
+      epoch_seconds = 0;
+      timed_windows = 0;
     }
   }
 }
@@ -389,14 +481,14 @@ void run(const Config &c) {
 int main(int argc, char **argv) try {
   if (argc == 1 || std::string(argv[1]) == "--help") {
     std::cout << "Usage: rwkv7_train INPUT.pth --dataset PATH --out DIR "
-                 "--steps N [options]\n"
+                 "[--steps N] [--nccl-bucket-mb MiB] [options]\n"
                  "  Data: --mask PATH --tokenizer PATH --ctx N --seed N "
                  "--start-window N\n"
                  "  CUDA: --devices 0,1 --batch N --accum N --head-chunk N\n"
                  "        --activation-checkpoint 0|1 --wkv-v3 0|1\n"
                  "  AdamW: --lr X --lr-final X --warmup N --beta1 X --beta2 X\n"
                  "         --weight-decay X --adam-eps X --clip X\n"
-                 "  Weights: --save-every N --start-step N\n";
+                 "  Weights: --start-step N\n";
     return argc == 1 ? 1 : 0;
   }
   rwkv::run(rwkv::config(argc, argv));

@@ -24,7 +24,7 @@ mkdir -p out
 
 ./build/rwkv7_train out/rwkv-init.pth \
   --dataset corpus.jsonl --out out/run \
-  --ctx 1024 --batch 2 --accum 4 --steps 1000 --save-every 100 \
+  --ctx 1024 --batch 2 --accum 4 --steps 1000 \
   --lr 6e-4 --lr-final 1e-5 --warmup 10 --devices 0
 ```
 
@@ -32,7 +32,7 @@ mkdir -p out
 
 `--batch` 是每卡的 microbatch 大小，`--accum` 是每次更新的 microbatch 数。`--ctx` 是窗口上限，须为 16 的倍数。默认重新计算各层激活，可用 `--activation-checkpoint 0` 保留激活，用 `--head-chunk` 控制单次计算的有效目标行数，用 `--wkv-v3 1` 切换 WKV v3。每个 microbatch 的有效长度按目标位置对齐到 16。
 
-`--devices 0,1` 使用单机 NCCL 数据并行，每卡持有完整模型和优化器状态。交叉熵与 L2Wrap 梯度统一除以全卡和梯度累积期间的有效目标数，再通过 NCCL 对梯度求和。只由首卡写出 `rwkv-<step>.pth`。训练结束总会保存一次。继续训练时可用 `--start-step` 延续步号与 warmup 进度，用上一条日志的 `next_window` 设置 `--start-window` 以续接取样位置。权重文件只保存模型参数，重新加载会重新创建 AdamW 状态。
+`--devices 0,1` 使用单机 NCCL 数据并行，每卡持有完整模型和优化器状态。交叉熵与 L2Wrap 梯度统一除以全卡和梯度累积期间的有效目标数，再通过 NCCL 对梯度求和。只由首卡写出 `rwkv-<step>.pth`。每个 mini epoch 结束时保存一次，最后不足一轮也保存。已存在的输出目录会为新训练创建独立子目录。继续训练时可用 `--start-step` 延续步号与 warmup 进度，用上一条日志的 `next_window` 设置 `--start-window` 以续接取样位置。权重文件只保存模型参数，重新加载会重新创建 AdamW 状态。
 
 ## 数据掩码
 
@@ -67,3 +67,6 @@ cmake --build build-hip
 ```
 
 根目录的初始化与训练程序使用 NVIDIA CUDA 后端。HIP 构建目标为算子库 `rwkv7_hip_ops`。
+
+
+每个完整 mini epoch 读取 40320 个上下文窗口，与 RWKV-LM-V7 的样本数一致。全局批大小为每卡 batch × GPU 数 × 梯度累积次数。在 `train.sh` 中将 `TRAIN_STEPS` 留空，训练器会根据数据索引和全局批大小计算步数，读到本次数据遍历结束。mini epoch 边界和数据尾部均可使用不足一批的窗口。全掩码批计入数据进度，跳过 AdamW 更新。填写正整数可指定批次数，允许跨数据遍历循环取样。`NCCL_BUCKET_MB` 以 MiB 设置每次 NCCL FP32 梯度求和的最大通信量。
