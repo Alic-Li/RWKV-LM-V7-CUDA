@@ -8,9 +8,10 @@
 #endif
 #include <algorithm>
 #include <chrono>
-#include <tuple>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
-#include <future>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
@@ -18,6 +19,7 @@
 #include <sstream>
 #include <sys/ioctl.h>
 #include <thread>
+#include <type_traits>
 #include <unistd.h>
 
 namespace rwkv {
@@ -26,27 +28,13 @@ using Index = std::uint64_t;
 
 struct Config {
   std::string input, dataset, mask, tokenizer, output;
-  std::vector<int> devices;
+  int device;
   int context, batch, accum, head_chunk;
   Index steps, epoch_save, bucket_mib, warmup, start_step, start_window, seed;
   bool optimized_wkv, checkpoint_activations;
   Adam adam;
   double final_lr;
 };
-
-std::vector<int> parse_devices(const std::string &text) {
-  std::vector<int> result;
-  for (std::size_t start = 0;;) {
-    const auto end = text.find(',', start);
-    const int id = integer<int>(text.substr(start, end - start));
-    if (id < 0 || std::find(result.begin(), result.end(), id) != result.end())
-      throw std::invalid_argument("device IDs must be non-negative and unique");
-    result.push_back(id);
-    if (end == std::string::npos)
-      return result;
-    start = end + 1;
-  }
-}
 
 bool boolean(Options &options, const std::string &name, bool fallback) {
   const int i = options.number(name, int(fallback));
@@ -64,7 +52,7 @@ Config config(int argc, char **argv) {
   c.tokenizer =
       options.take("--tokenizer", "data/tokenizer/rwkv_vocab_v20230424.txt");
   c.output = options.take("--out");
-  c.devices = parse_devices(options.take("--devices", "0"));
+  c.device = options.number("--devices", 0);
   c.context = options.number("--ctx", 1024);
   c.batch = options.number("--batch", 1);
   c.accum = options.number("--accum", 1);
@@ -140,178 +128,150 @@ void nccl_ok(ncclResult_t status) {
 }
 #endif
 
+int env_rank(const char *name, int fallback) {
+  const char *value = std::getenv(name);
+  return value ? integer<int>(value) : fallback;
+}
+
 class DataParallel {
 public:
-  explicit DataParallel(const std::vector<int> &devices)
-#ifdef RWKV_HAVE_NCCL
-      : devices_(devices)
-#endif
-  {
-    if (devices.size() == 1)
+  DataParallel(int rank, int world, cudaStream_t compute) : compute_(compute) {
+    int least, highest;
+    CUDA(cudaDeviceGetStreamPriorityRange(&least, &highest));
+    CUDA(cudaStreamCreateWithPriority(&comm_stream_, cudaStreamNonBlocking,
+                                      highest));
+    CUDA(cudaEventCreateWithFlags(&ready_, cudaEventDisableTiming));
+    CUDA(cudaEventCreateWithFlags(&done_, cudaEventDisableTiming));
+    if (world == 1)
       return;
 #ifdef RWKV_HAVE_NCCL
-    comms_.resize(devices.size(), nullptr);
-    const auto result =
-        ncclCommInitAll(comms_.data(), devices.size(), devices.data());
-    if (result != ncclSuccess) {
-      abort();
-      nccl_ok(result);
+    const auto dir = std::getenv("RWKV_RENDEZVOUS");
+    if (!dir)
+      throw std::runtime_error("missing RWKV_RENDEZVOUS");
+    const auto path = std::filesystem::path(dir) / "comm.id";
+    ncclUniqueId id;
+    if (!rank) {
+      nccl_ok(ncclGetUniqueId(&id));
+      std::ofstream out(path.string() + ".tmp", std::ios::binary);
+      out.write(reinterpret_cast<const char *>(&id), sizeof(id));
+      out.close();
+      if (!out)
+        throw std::runtime_error("cannot publish communicator ID");
+      std::filesystem::rename(path.string() + ".tmp", path);
+    } else {
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::minutes(10);
+      while (!std::filesystem::exists(path)) {
+        if (std::chrono::steady_clock::now() > deadline)
+          throw std::runtime_error("communicator rendezvous timed out");
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+      std::ifstream in(path, std::ios::binary);
+      if (!in.read(reinterpret_cast<char *>(&id), sizeof(id)))
+        throw std::runtime_error("cannot read communicator ID");
     }
+    nccl_ok(ncclCommInitRank(&comm_, world, id, rank));
 #else
-    throw std::runtime_error("multi-GPU training requires a build with NCCL or RCCL");
+    throw std::runtime_error("distributed training requires NCCL or RCCL");
 #endif
   }
 
   ~DataParallel() {
 #ifdef RWKV_HAVE_NCCL
-    if (std::uncaught_exceptions())
-      abort();
-    else
-      for (auto comm : comms_)
-        ncclCommDestroy(comm);
+    if (comm_) {
+      if (std::uncaught_exceptions())
+        ncclCommAbort(comm_);
+      else
+        ncclCommDestroy(comm_);
+    }
+#endif
+    (void)cudaEventDestroy(done_);
+    (void)cudaEventDestroy(ready_);
+    (void)cudaStreamDestroy(comm_stream_);
+  }
+
+  void sum(Model &model, std::size_t bucket) {
+#ifdef RWKV_HAVE_NCCL
+    if (!comm_)
+      return;
+    begin();
+    for (std::size_t off = 0; off < model.parameter_count();) {
+      const auto n = std::min(bucket, model.parameter_count() - off);
+      float *g = model.gradients() + off;
+      nccl_ok(
+          ncclAllReduce(g, g, n, ncclFloat32, ncclSum, comm_, comm_stream_));
+      off += n;
+    }
+    end();
 #endif
   }
 
-  void sum(const std::vector<std::unique_ptr<Model>> &models,
-           std::size_t bucket_elements) {
+  // Called at step boundaries for the global target count, loss and VRAM
+  // checks.
+  enum class Reduction { sum, min, max };
+  template <class T> T scalar(T value, Reduction op = Reduction::sum) {
 #ifdef RWKV_HAVE_NCCL
-    if (comms_.empty())
-      return;
-    const auto total = models.front()->parameter_count();
-    for (std::size_t offset = 0; offset < total;) {
-      const auto count = std::min(bucket_elements, total - offset);
-      nccl_ok(ncclGroupStart());
-      ncclResult_t first_error = ncclSuccess;
-      cudaError_t cuda_status = cudaSuccess;
-      for (std::size_t i = 0; i < models.size(); ++i) {
-        cuda_status = cudaSetDevice(devices_[i]);
-        if (cuda_status != cudaSuccess)
-          break;
-        auto &m = *models[i];
-        const auto status =
-            ncclAllReduce(m.gradients() + offset, m.gradients() + offset, count,
-                          ncclFloat32, ncclSum, comms_[i], m.stream());
-        if (first_error == ncclSuccess)
-          first_error = status;
-      }
-      const auto group_status = ncclGroupEnd();
-      CUDA(cuda_status);
-      nccl_ok(first_error);
-      nccl_ok(group_status);
-      offset += count;
-    }
-#else
-    (void)models;
-    (void)bucket_elements;
-#endif
-  }
-
-  void synchronize(const std::vector<std::unique_ptr<Model>> &models) {
-#ifdef RWKV_HAVE_NCCL
-    if (!comms_.empty()) {
-      bool pending;
-      do {
-        pending = false;
-        for (std::size_t i = 0; i < models.size(); ++i) {
-          ncclResult_t status;
-          nccl_ok(ncclCommGetAsyncError(comms_[i], &status));
-          nccl_ok(status);
-          models[i]->activate();
-          const auto ready = cudaStreamQuery(models[i]->stream());
-          if (ready == cudaErrorNotReady)
-            pending = true;
-          else
-            CUDA(ready);
-        }
-        if (pending)
-          std::this_thread::sleep_for(std::chrono::microseconds(100));
-      } while (pending);
-      return;
+    if (comm_) {
+      static_assert(sizeof(T) == 8);
+      auto p = scalar_.get();
+      std::memcpy(host_scalar_.data(), &value, sizeof(T));
+      CUDA(cudaMemcpyAsync(p, host_scalar_.data(), sizeof(T),
+                           cudaMemcpyHostToDevice, compute_));
+      begin();
+      nccl_ok(ncclAllReduce(
+          p, p, 1, std::is_same_v<T, double> ? ncclFloat64 : ncclUint64,
+          op == Reduction::sum   ? ncclSum
+          : op == Reduction::min ? ncclMin
+                                 : ncclMax,
+          comm_, comm_stream_));
+      end();
+      CUDA(cudaMemcpyAsync(host_scalar_.data(), p, sizeof(T),
+                           cudaMemcpyDeviceToHost, compute_));
+      CUDA(cudaStreamSynchronize(compute_));
+      std::memcpy(&value, host_scalar_.data(), sizeof(T));
     }
 #endif
-    models.front()->synchronize();
+    return value;
   }
 
 private:
-#ifdef RWKV_HAVE_NCCL
-  void abort() {
-    for (auto comm : comms_)
-      if (comm)
-        ncclCommAbort(comm);
+  void begin() {
+    CUDA(cudaEventRecord(ready_, compute_));
+    CUDA(cudaStreamWaitEvent(comm_stream_, ready_, 0));
   }
-  std::vector<int> devices_;
-  std::vector<ncclComm_t> comms_;
+  void end() {
+    CUDA(cudaEventRecord(done_, comm_stream_));
+    CUDA(cudaStreamWaitEvent(compute_, done_, 0));
+  }
+  cudaStream_t compute_, comm_stream_{};
+  cudaEvent_t ready_{}, done_{};
+  Buffer<Index> scalar_{1};
+  std::vector<Index, PinnedAllocator<Index>> host_scalar_{0};
+#ifdef RWKV_HAVE_NCCL
+  ncclComm_t comm_ = nullptr;
 #endif
 };
 
-struct Lane {
-  std::vector<int> input;
-  std::vector<std::int64_t> labels;
-  int time = 0, targets = 0;
-};
-
-// Assign whole sequences within one global microbatch. Keep causal order within
-// each sequence and keep the sampler cursor independent of the rank mapping.
-void fill_ranks(MicroBatch *ranks, std::vector<Lane> &lanes, const Dataset &data,
-                Sampler &sampler, const Config &c, std::size_t count) {
-  const auto devices = c.devices.size();
-  std::vector<std::size_t> active;
-  for (std::size_t i = 0; i < count; ++i) {
-    auto &lane = lanes[i];
-    lane.input.resize(c.context);
-    lane.labels.resize(c.context);
-    data.sample(sampler.next(), lane.input.data(), lane.labels.data());
-    lane.time = lane.targets = 0;
+void fill_local(MicroBatch &batch, const Dataset &data, Sampler &sampler,
+                const Config &c, Index count, int rank, int world,
+                std::vector<std::int64_t> &labels) {
+  batch.labels.clear();
+  batch.active_rows.clear();
+  batch.losses.clear();
+  std::fill(batch.input.begin(), batch.input.end(), 0);
+  // Every process advances the same global cursor. Only the owner reads the
+  // window.
+  for (Index i = 0; i < count; ++i) {
+    const Index window = sampler.next();
+    if (i % world != Index(rank))
+      continue;
+    const int offset = int(i / world) * c.context;
+    data.sample(window, batch.input.data() + offset, labels.data());
     for (int t = 0; t < c.context; ++t) {
-      if (lane.labels[t] >= 0) {
-        lane.time = t + 1;
-        ++lane.targets;
-      }
-    }
-    if (lane.targets)
-      active.push_back(i);
-  }
-  if (devices > 1)
-    std::stable_sort(active.begin(), active.end(), [&](auto a, auto b) {
-      return std::tie(lanes[a].time, lanes[a].targets) >
-             std::tie(lanes[b].time, lanes[b].targets);
-    });
-  std::vector<std::vector<std::size_t>> assigned(devices);
-  std::vector<int> targets(devices);
-  for (auto i : active) {
-    std::size_t rank = 0;
-    for (std::size_t r = 1; r < devices; ++r)
-      if (std::make_pair(assigned[r].size(), targets[r]) <
-          std::make_pair(assigned[rank].size(), targets[rank]))
-        rank = r;
-    assigned[rank].push_back(i);
-    targets[rank] += lanes[i].targets;
-  }
-  for (std::size_t r = 0; r < devices; ++r) {
-    auto &batch = ranks[r];
-    batch.lanes = assigned[r].size();
-    batch.time = 0;
-    for (auto i : assigned[r])
-      batch.time = std::max(batch.time, lanes[i].time);
-    batch.time = (batch.time + 15) / 16 * 16;
-    batch.input.resize(batch.lanes * batch.time);
-    batch.active_rows.clear();
-    batch.labels.clear();
-    batch.losses.clear();
-    batch.active_rows.reserve(targets[r]);
-    batch.labels.reserve(targets[r]);
-    batch.losses.reserve(targets[r]);
-    int offset = 0;
-    for (auto i : assigned[r]) {
-      const auto &lane = lanes[i];
-      std::copy_n(lane.input.begin(), batch.time, batch.input.begin() + offset);
-      for (int t = 0; t < lane.time; ++t) {
-        if (lane.labels[t] >= 0) {
-          batch.active_rows.push_back(offset + t);
-          batch.labels.push_back(lane.labels[t]);
-        }
-      }
-      offset += batch.time;
+      if (labels[t] < 0)
+        continue;
+      batch.active_rows.push_back(offset + t);
+      batch.labels.push_back(labels[t]);
     }
   }
 }
@@ -328,6 +288,23 @@ double learning_rate(const Config &c, Index i) {
 }
 
 void run(Config c) {
+  const int rank = env_rank("LOCAL_RANK", 0), world = env_rank("WORLD_SIZE", 1);
+  if (world < 1 || rank < 0 || rank >= world || (world > 1 && c.device != 0) ||
+      c.device < 0)
+    throw std::invalid_argument("use the platform training script for one process per visible GPU");
+  const int device = world == 1 ? c.device : rank;
+  int device_count;
+  CUDA(cudaGetDeviceCount(&device_count));
+  if (world > device_count || device >= device_count)
+    throw std::invalid_argument("requested GCDs exceed visible devices");
+  CUDA(cudaSetDevice(device));
+#ifndef RWKV_ROCM
+  cudaDeviceProp prop;
+  CUDA(cudaGetDeviceProperties(&prop, device));
+  if (prop.major < 8)
+    throw std::invalid_argument(
+        "BF16 training requires CUDA compute capability 8.0 or newer");
+#endif
   const Checkpoint input(c.input);
   const auto shape = input.shape();
   const auto layout = weight_layout(shape);
@@ -338,7 +315,7 @@ void run(Config c) {
         "batch and context exceed the GPU kernel indexing range");
   const Dataset data(c.dataset, c.mask, c.tokenizer, c.context, shape.vocab);
   constexpr Index epoch_windows = 40320;
-  const Index global_batch = Index(c.batch) * c.devices.size() * c.accum;
+  const Index global_batch = Index(c.batch) * world * c.accum;
   const bool full_pass = c.steps == 0;
   // Resume an automatic run at its absolute window cursor within this pass.
   if (full_pass && c.start_window >= data.size()) {
@@ -357,24 +334,10 @@ void run(Config c) {
     if (c.steps > UINT64_MAX - c.start_step)
       throw std::invalid_argument("step range overflow");
   }
-  int device_count;
-  CUDA(cudaGetDeviceCount(&device_count));
-  for (int id : c.devices) {
-    if (id >= device_count)
-      throw std::invalid_argument("GPU device is not visible: " +
-                                  std::to_string(id));
-#ifndef RWKV_ROCM
-    cudaDeviceProp prop;
-    CUDA(cudaGetDeviceProperties(&prop, id));
-    if (prop.major < 8)
-      throw std::invalid_argument(
-          "BF16 training requires CUDA compute capability 8.0 or newer");
-#endif
-  }
   // Reserve a fresh output directory before training so older checkpoints
   // cannot collide with a save several hundred steps later.
   std::filesystem::path output = c.output;
-  if (!std::filesystem::create_directories(output)) {
+  if (!rank && !std::filesystem::create_directories(output)) {
     for (Index i = 1;; ++i) {
       output = std::filesystem::path(c.output) / ("run-" + std::to_string(i));
       if (std::filesystem::create_directory(output))
@@ -392,27 +355,78 @@ void run(Config c) {
                            ? ceil_div(c.steps - first_steps, normal_steps)
                            : 0);
 
-  std::vector<MicroBatch> micro(std::size_t(c.accum) * c.devices.size());
-  std::vector<std::unique_ptr<Model>> models;
-  DataParallel dp(c.devices);
-  for (int id : c.devices)
-    models.push_back(std::make_unique<Model>(id, input, shape, layout,
-                                             c.head_chunk, c.optimized_wkv,
-                                             c.checkpoint_activations));
+  std::vector<MicroBatch> micro(c.accum);
+  std::vector<std::int64_t> labels(c.context);
+  for (auto &b : micro) {
+    b.lanes = c.batch;
+    b.time = c.context;
+    b.input.resize(rows);
+    b.active_rows.reserve(rows);
+    b.labels.reserve(rows);
+    b.losses.reserve(rows);
+  }
+  Model model(device, input, shape, layout, c.head_chunk, c.optimized_wkv,
+              c.checkpoint_activations, rows, c.accum > 1, c.adam.clip > 0);
+  DataParallel dp(rank, world, model.stream());
+  const Index bucket = c.bucket_mib * (1024 * 1024 / sizeof(float));
+  // Exercise maximum shapes and all collective types before the memory
+  // baseline.
+  model.clear_gradients();
+  for (auto &warm : micro) {
+    warm.labels.resize(rows, 0);
+    warm.active_rows.resize(rows);
+    std::iota(warm.active_rows.begin(), warm.active_rows.end(), 0);
+    model.accumulate(warm, rows * c.accum);
+  }
+  model.clear_gradients();
+  dp.sum(model, bucket);
+  model.gradient_scale(c.adam.clip);
+  model.warm_optimizer();
+  dp.scalar(0.0);
+  dp.scalar(Index(0));
+  dp.scalar(Index(0), DataParallel::Reduction::min);
+  dp.scalar(Index(0), DataParallel::Reduction::max);
+  model.synchronize();
+  const bool log_vram_samples = !isatty(STDERR_FILENO);
+  Index baseline = 0;
+  auto check_memory = [&](Index step) {
+    std::size_t free_b, total_b;
+    CUDA(cudaMemGetInfo(&free_b, &total_b));
+    if (!step)
+      baseline = free_b;
+    const bool sample = !step || step == 1 || step == 5 || step == 20;
+    if ((sample && log_vram_samples) || free_b != baseline) {
+      std::ostringstream log;
+      log << "vram rank=" << rank << " step=" << step << " free_b=" << free_b
+          << " total_b=" << total_b << '\n';
+      std::cerr << log.str();
+    }
+    if (step && free_b != baseline)
+      throw std::runtime_error("VRAM drift from initialization baseline " +
+                               std::to_string(baseline));
+    if (sample) {
+      const Index used = total_b - free_b;
+      const Index lo = dp.scalar(used, DataParallel::Reduction::min);
+      const Index hi = dp.scalar(used, DataParallel::Reduction::max);
+      if (hi - lo > 64 * 1024 * 1024)
+        throw std::runtime_error("rank memory spread exceeds 64 MiB");
+    }
+  };
+  check_memory(0);
   Sampler sampler(data.size(), c.seed, c.start_window);
-  std::cout << "parameters=" << models.front()->parameter_count()
-            << " windows=" << data.size() << " global_batch=" << global_batch
-            << " ctx=" << c.context << " micro_batch=" << c.batch
-            << " accum=" << c.accum << " planned_steps=" << c.steps
-            << " epoch_save=" << c.epoch_save << " mini_epochs=" << epochs
-            << " steps_per_full_mini_epoch=" << normal_steps
-            << " start_window=" << c.start_window
-            << " output=" << output.string()
-            << " mini_epoch_windows=" << epoch_windows
-            << " nccl_bucket_mib=" << c.bucket_mib
-            << " devices=" << models.size() << '\n';
-  const auto rank_capacity = c.devices.size() * c.batch;
-  std::vector<Lane> lanes(rank_capacity);
+  if (!rank)
+    std::cout << "parameters=" << model.parameter_count()
+              << " windows=" << data.size() << " global_batch=" << global_batch
+              << " ctx=" << c.context << " micro_batch=" << c.batch
+              << " accum=" << c.accum << " planned_steps=" << c.steps
+              << " epoch_save=" << c.epoch_save << " mini_epochs=" << epochs
+              << " steps_per_full_mini_epoch=" << normal_steps
+              << " start_window=" << c.start_window
+              << " output=" << output.string()
+              << " mini_epoch_windows=" << epoch_windows
+              << " nccl_bucket_mib=" << c.bucket_mib << " devices=" << world
+              << '\n';
+  const auto rank_capacity = Index(world) * c.batch;
   const bool interactive = isatty(STDOUT_FILENO);
   Index updates = 0;
   double epoch_seconds = 0;
@@ -432,44 +446,33 @@ void run(Config c) {
       length = offset + (c.steps - completed) * global_batch;
     Index pending =
         std::min(global_batch, length - (initial_window - epoch_start));
-    for (std::size_t i = 0; i < micro.size(); i += models.size()) {
+    for (auto &batch : micro) {
       const auto count = std::min<Index>(rank_capacity, pending);
-      fill_ranks(micro.data() + i, lanes, data, sampler, c, count);
+      fill_local(batch, data, sampler, c, count, rank, world, labels);
+      valid += batch.labels.size();
       pending -= count;
     }
-    for (const auto &batch : micro)
-      valid += batch.labels.size();
-
+    valid = dp.scalar(Index(valid));
     double loss = 0;
     auto opt = c.adam;
     opt.lr = learning_rate(c, step - 1);
     if (valid) {
-      auto accumulate_rank = [&](std::size_t rank) {
-        auto &model = *models[rank];
-        model.clear_gradients(c.accum > 1);
-        for (std::size_t i = rank; i < micro.size(); i += models.size())
-          model.accumulate(micro[i], valid);
-      };
-      std::vector<std::future<void>> workers;
-      for (std::size_t rank = 1; rank < models.size(); ++rank)
-        workers.push_back(std::async(std::launch::async, accumulate_rank, rank));
-      accumulate_rank(0);
-      for (auto &worker : workers)
-        worker.get();
-      dp.sum(models, c.bucket_mib * (1024 * 1024 / sizeof(float)));
-      dp.synchronize(models);
+      model.clear_gradients();
+      for (auto &batch : micro)
+        model.accumulate(batch, valid);
+      dp.sum(model, bucket);
+      model.synchronize();
 
       for (const auto &batch : micro)
         loss = std::accumulate(batch.losses.begin(), batch.losses.end(), loss);
-      loss /= valid;
+      loss = dp.scalar(loss) / valid;
       if (!std::isfinite(loss))
         throw std::runtime_error("non-finite masked loss");
 
       ++updates;
-      const float scale = models.front()->gradient_scale(opt.clip);
-      for (auto &model : models)
-        model->update(opt, updates, scale);
-      dp.synchronize(models);
+      const float scale = model.gradient_scale(opt.clip);
+      model.update(opt, updates, scale);
+      model.synchronize();
     }
     ++completed;
     const double seconds =
@@ -481,7 +484,7 @@ void run(Config c) {
     timed_windows += sampler.position() - initial_window;
     if (completed == c.steps && !updates)
       throw std::runtime_error("no unmasked targets in remaining dataset");
-    if (interactive || finished) {
+    if (!rank && (interactive || finished)) {
       const int filled = static_cast<int>(24.0 * progress / length);
       std::ostringstream line;
       line << "mini_epoch=" << epoch - first_epoch + 1 << '/' << epochs << " ["
@@ -491,7 +494,7 @@ void run(Config c) {
            << " ETA="
            << std::llround(epoch_seconds / timed_windows * (length - progress))
            << "s lr=" << opt.lr << " targets=" << valid
-           << " targets/s=" << valid / seconds;
+           << " tokens/s=" << valid / seconds;
       auto message = line.str();
       if (interactive) {
         struct winsize size{};
@@ -507,13 +510,20 @@ void run(Config c) {
         std::cout << '\n';
       std::cout << std::flush;
     }
-    if (completed == c.steps ||
-        (finished && c.epoch_save && (epoch - first_epoch) % c.epoch_save == 0)) {
+    const bool save =
+        completed == c.steps ||
+        (finished && c.epoch_save && (epoch - first_epoch) % c.epoch_save == 0);
+    if (save && !rank) {
       const auto path = output / ("rwkv-" + std::to_string(step) + ".pth");
-      models.front()->save(path.string());
+      model.save(path.string());
       std::cout << "saved=" << path.string() << " step=" << step
                 << " next_window=" << sampler.position() << std::endl;
     }
+    if (save)
+      dp.scalar(Index(0));
+    check_memory(completed);
+    if (completed == c.steps)
+      dp.scalar(Index(0));
     if (finished) {
       epoch_seconds = 0;
       timed_windows = 0;
@@ -529,7 +539,7 @@ int main(int argc, char **argv) try {
                  "[--steps N] [--nccl-bucket-mb MiB] [options]\n"
                  "  Data: --mask PATH --tokenizer PATH --ctx N --seed N "
                  "--start-window N\n"
-                 "  GPU: --devices 0,1 --batch N --accum N --head-chunk N\n"
+                 "  GPU: --devices ID --batch N --accum N --head-chunk N\n"
                  "        --activation-checkpoint 0|1 --wkv-v3 0|1\n"
                  "  AdamW: --lr X --lr-final X --warmup N --beta1 X --beta2 X\n"
                  "         --weight-decay X --adam-eps X --clip X\n"

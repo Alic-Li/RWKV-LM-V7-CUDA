@@ -65,12 +65,12 @@ GradientNorm::GradientNorm(cudaStream_t stream, int resident_threads,
   // The outer norm uses the same reduction on the vector of parameter norms.
   final_ = group({0, groups_}, 0, resident_threads);
   plan.push_back(final_);
-  plan_ = Buffer<Group>(stream, plan.size());
-  owners_ = Buffer<unsigned>(stream, owners.size());
-  partial_ = Buffer<float>(stream, partials_);
-  norms_ = Buffer<float>(stream, groups_);
-  final_partial_ = Buffer<float>(stream, final_.blocks);
-  result_ = Buffer<float>(stream, 1);
+  plan_ = Buffer<Group>(plan.size());
+  owners_ = Buffer<unsigned>(owners.size());
+  partial_ = Buffer<float>(partials_);
+  norms_ = Buffer<float>(groups_);
+  final_partial_ = Buffer<float>(final_.blocks);
+  result_ = Buffer<float>(1);
   CUDA(cudaMemcpyAsync(plan_.get(), plan.data(), plan.size() * sizeof(Group),
                        cudaMemcpyHostToDevice, stream));
   CUDA(cudaMemcpyAsync(owners_.get(), owners.data(),
@@ -135,10 +135,9 @@ float GradientNorm::compute(cudaStream_t stream, const float *gradient) const {
       norms_.get(), outer, nullptr, final_partial_.get());
   finish<<<1, final_.threads, 0, stream>>>(outer, final_partial_.get(),
                                            result_.get());
-  float norm;
-  CUDA(cudaMemcpyAsync(&norm, result_.get(), sizeof(norm),
+  CUDA(cudaMemcpyAsync(host_result_.data(), result_.get(), sizeof(float),
                        cudaMemcpyDeviceToHost, stream));
   CUDA(cudaStreamSynchronize(stream));
-  return norm;
+  return host_result_.front();
 }
 } // namespace rwkv

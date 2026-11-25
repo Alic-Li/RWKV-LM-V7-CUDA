@@ -213,7 +213,7 @@ void layer_norm(cudaStream_t stream, int rows, int width, const BF *input,
       width, input, residual, sum, weight, bias, output, mean, inv_std);
 }
 
-void layer_norm_backward(cudaStream_t stream, int rows, int width,
+void layer_norm_backward(Arena &arena, cudaStream_t stream, int rows, int width,
                          const BF *input, const BF *dy, const BF *weight,
                          const float *mean, const float *inv_std, BF *dx,
                          float *dw, float *db) {
@@ -227,7 +227,7 @@ void layer_norm_backward(cudaStream_t stream, int rows, int width,
     if (columns < sms / 2) {
       const int parts = std::min((rows + 31) / 32, 32768 / columns);
       const size_t elements = size_t(parts) * width;
-      Buffer<BF> scratch(stream, 2 * elements);
+      auto scratch = arena.take<BF>(2 * elements);
       BF *weights = scratch.get(), *biases = weights + elements;
       affine_partials<<<dim3(columns, parts), 32, 0, stream>>>(
           rows, width, input, dy, mean, inv_std, weights, biases);

@@ -60,21 +60,26 @@ __global__ void reduce_tokens(const int *tokens, const int *positions,
 }
 } // namespace
 
-void embedding_gradient(cudaStream_t stream, int rows, int channels,
+std::size_t embedding_sort_bytes(cudaStream_t stream, int rows) {
+  std::size_t bytes = 0;
+  int *p = nullptr;
+  CUDA(DeviceRadixSort::SortPairs(nullptr, bytes, static_cast<const int *>(p),
+                                  p, static_cast<const int *>(p), p, rows, 0,
+                                  31, stream));
+  return bytes;
+}
+
+void embedding_gradient(Arena &arena, std::size_t scratch_bytes,
+                        cudaStream_t stream, int rows, int channels,
                         const int *tokens, const __nv_bfloat16 *upstream,
                         float *gradient) {
-  Buffer<int> sorted(stream, rows), positions(stream, rows);
-  Buffer<int> indices(stream, rows);
+  auto sorted = arena.take<int>(rows), positions = arena.take<int>(rows);
+  auto indices = arena.take<int>(rows);
   row_numbers<<<(rows - 1) / 256 + 1, 256, 0, stream>>>(indices.get(), rows);
-  std::size_t bytes = 0;
-  auto sort = [&](void *scratch) {
-    CUDA(DeviceRadixSort::SortPairs(scratch, bytes, tokens, sorted.get(),
-                                         indices.get(), positions.get(), rows,
-                                         0, 31, stream));
-  };
-  sort(nullptr);
-  Buffer<unsigned char> scratch(stream, bytes);
-  sort(scratch.get());
+  auto scratch = arena.take<unsigned char>(scratch_bytes);
+  CUDA(DeviceRadixSort::SortPairs(scratch.get(), scratch_bytes, tokens,
+                                  sorted.get(), indices.get(), positions.get(),
+                                  rows, 0, 31, stream));
   const dim3 blocks((rows - 1) / 8 + 1, (channels - 1) / channels_per_tile + 1);
   const dim3 threads(channels_per_tile, 8);
   if (rows <= 3072)

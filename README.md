@@ -1,6 +1,6 @@
 # RWKV-7 CUDA/C++ 预训练
 
-`rwkv7_init` 独立生成初始权重。`rwkv7_train` 从一个 x070 PyTorch `.pth` state dict 推断模型维度，训练所有模型参数，并按步输出 BF16 state dict。两个程序都可直接运行，无需 Python 环境或 LibTorch。训练使用本仓库的 WKV、TimeMix、ChannelMix 和分块 Head/L2Wrap 融合算子，线性层和反向矩阵乘法使用 cuBLAS。
+`rwkv7_init` 独立生成初始权重。`rwkv7_train` 从一个 x070 PyTorch `.pth` state dict 推断模型维度，训练所有模型参数，并按步输出 BF16 state dict。两个程序都可直接运行，无需 Python 环境或 LibTorch。训练使用本仓库的 WKV、TimeMix、ChannelMix 和分块 Head/L2Wrap 融合算子，线性层和反向矩阵乘法使用 cuBLAS 或 rocBLAS。
 
 ## 编译
 
@@ -18,7 +18,7 @@ cmake --build build
 
 ### AMD ROCm
 
-在 AMD Instinct MI250 上，安装 ROCm、hipBLAS、hipSOLVER、hipCUB 和 libarchive 开发包后，从项目根目录编译初始化和训练程序。多卡训练需要 RCCL，CMake 会自动检测。
+在 AMD Instinct MI250 上，安装 ROCm、rocBLAS、hipSOLVER、hipCUB 和 libarchive 开发包后，从项目根目录编译初始化和训练程序。多卡训练需要 RCCL，CMake 会自动检测。
 
 ```bash
 cmake -S . -B build-rocm -DCMAKE_BUILD_TYPE=Release \
@@ -27,7 +27,14 @@ cmake -S . -B build-rocm -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-rocm --parallel
 ```
 
-以下示例在 ROCm 上使用 `./build-rocm/rwkv7_init` 和 `./build-rocm/rwkv7_train`。运行脚本时可用 `BUILD_DIR=build-rocm` 指定同一目录。
+在项目根目录运行对应平台的脚本。常用参数集中在每个脚本开头，直接修改后执行即可。已有权重时可直接启动训练。准备脚本默认写入 `rwkv-init.pth`，两个平台均可通过首个参数指定其他输出文件并传入完整初始化参数。
+
+| 平台 | 准备权重 | 启动训练 | 默认构建目录 |
+|---|---|---|---|
+| AMD MI250 | `./prepare_amd.sh`（24 层，宽度 1024） | `./train_amd.sh`（8 GCD） | `./build-rocm` |
+| NVIDIA CUDA | `./prepare_nvidia.sh`（12 层，宽度 768） | `./train_nvidia.sh`（单卡） | `./build` |
+
+可用 `BUILD_DIR` 指定其他构建目录。NVIDIA 多卡示例为 `CUDA_VISIBLE_DEVICES=0,1 WORLD_SIZE=2 ./train_nvidia.sh`，每个进程使用一个可见设备，多卡构建需要 NCCL。
 
 ## 初始化与训练
 
@@ -43,9 +50,20 @@ mkdir -p out
 
 已有 x070 权重时可以直接运行训练程序。初始化沿用原项目 x070 模型的参数形状、层相关常量和正交初始化增益。随机数序列由 C++ 的种子控制。Head size 固定为 64，默认 FFN 宽度为 embedding 宽度的 4 倍，默认词表大小为 65536。训练支持 PyTorch ZIP 格式中的 BF16、FP16 和 FP32 输入权重，激活为 BF16。每次反传的参数梯度先按 BF16 舍入，再以 FP32 跨 microbatch 累加、跨卡求和。梯度裁剪作用于归约后的梯度，主权重和 AdamW 矩状态均为 FP32。
 
-`--batch` 是每卡的 microbatch 大小，`--accum` 是每次更新的 microbatch 数。`--ctx` 是窗口上限，须为 16 的倍数。默认重新计算各层激活，可用 `--activation-checkpoint 0` 保留激活，用 `--head-chunk` 控制单次计算的有效目标行数，用 `--wkv-v3 1` 切换 WKV v3。每个 microbatch 的有效长度按目标位置对齐到 16。关闭激活重算时，tanh 和 sigmoid 的反传沿用原项目 TorchScript 预热后的 FP32 融合计算顺序。
+`--batch` 是每卡的 microbatch 大小，`--accum` 是每次更新的 microbatch 数。`--ctx` 是窗口上限，须为 16 的倍数。默认重新计算各层激活，可用 `--activation-checkpoint 0` 保留激活，用 `--head-chunk` 控制单次计算的有效目标行数，用 `--wkv-v3 1` 切换 WKV v3。每个 rank 按配置的 batch 和 ctx 填充输入，输出头按有效目标索引计算损失。关闭激活重算时，tanh 和 sigmoid 的反传沿用原项目 TorchScript 预热后的 FP32 融合计算顺序。
 
-`--devices 0,1` 使用单机 NCCL 数据并行，每卡持有完整模型和优化器状态。每个 microbatch 先按本地有效目标数计算平均损失，输出头反传后按本地目标数占本次更新总有效目标数的比例缩放梯度，再累积并通过 NCCL 求和。只由首卡写出 `rwkv-<step>.pth`。脚本参数 `EPOCH_SAVE` 对应 `--epoch-save`，默认为 1。保存周期沿用原项目从 0 开始的本次训练轮号。例如设为 2 时，进度条上第 1、3、5 轮结束时保存。设为 0 时仅在训练结束时保存。最后不足一轮也保存。已存在的输出目录会为新训练创建独立子目录。继续训练时可用 `--start-step` 延续步号与 warmup 进度，用上一条日志的 `next_window` 设置 `--start-window` 以续接取样位置。权重文件只保存模型参数，重新加载会重新创建 AdamW 状态。
+在 4 张 MI250 上用 `./train_amd.sh` 启动 8 个进程。脚本读取 `rocm-smi --showtoponuma`，用 `numactl` 绑定每个进程，由 local rank 选择 GCD。可直接给脚本传训练参数，例如：
+
+```bash
+./train_amd.sh rwkv-init.pth --dataset ../train.jsonl --out out/check \
+  --batch 16 --ctx 512 --accum 1 --head-chunk 65536 --steps 20
+```
+
+每个进程读取分给自己的样本，持有完整的模型、AdamW 状态和连续 FP32 梯度。有效目标数、梯度和 loss 经 RCCL 归约；各 rank 按全局目标数归一化后执行同一更新，rank 0 写 checkpoint。独立运行单卡时可用 `--devices ID`。每个模型按 `--batch`、`--ctx`、`--head-chunk` 的上限初始化 Arena 和锁页输入输出，并绑定 32 MiB BLAS workspace。初始化阶段预热整个梯度累积周期、集合通信和保存权重所用的 D2H 拷贝。输出头的尾块补零，保持 GEMM 形状固定。
+
+每个 rank 在初始化结束和每个 step 结束时检查设备可用显存字节数。交互终端仅在显存检查异常时显示诊断。将标准错误重定向到文件（如 `./train_amd.sh 2>vram.log`）时，初始化、第 1、5、20 步输出 `vram rank=... step=... free_b=... total_b=...`。同一 rank 的变化容差为 0 字节。跨 rank 的占用极差上限设为 64 MiB，用于容纳运行时与 RCCL 在不同 rank 上的占用差异。显存读数包含该 GCD 上其他进程的占用，验收时应独占设备。
+
+`--epoch-save` 默认为 1。保存周期沿用原项目从 0 开始的本次训练轮号。例如设为 2 时，进度条上第 1、3、5 轮结束时保存。设为 0 时仅在训练结束时保存。最后不足一轮也保存。已存在的输出目录会为新训练创建独立子目录。继续训练时可用 `--start-step` 延续步号与 warmup 进度，用上一条日志的 `next_window` 设置 `--start-window` 以续接取样位置。权重文件只保存模型参数，重新加载会重新创建 AdamW 状态。
 
 ## 数据掩码
 
@@ -84,4 +102,4 @@ cmake --build build-hip
 根目录启用 `RWKV_ROCM` 后，训练程序链接同一个 `rwkv7_hip_ops` 算子库。
 
 
-每个完整 mini epoch 读取 40320 个上下文窗口，与 RWKV-LM-V7 的样本数一致。全局批大小为每卡 batch × GPU 数 × 梯度累积次数。在 `train.sh` 中将 `TRAIN_STEPS` 留空，训练器会根据数据索引和全局批大小计算步数，读到本次数据遍历结束。mini epoch 边界和数据尾部均可使用不足一批的窗口。全掩码批计入数据进度，跳过 AdamW 更新。填写正整数可指定批次数，允许跨数据遍历循环取样。`NCCL_BUCKET_MB` 以 MiB 设置每次 NCCL FP32 梯度求和的最大通信量。
+每个完整 mini epoch 读取 40320 个上下文窗口，与 RWKV-LM-V7 的样本数一致。全局批大小为每卡 batch × GPU 数 × 梯度累积次数。省略 `--steps` 时，训练器会根据数据索引和全局批大小计算步数，读到本次数据遍历结束。mini epoch 边界和数据尾部均可使用不足一批的窗口。全掩码批计入数据进度，跳过 AdamW 更新。填写正整数可指定批次数，允许跨数据遍历循环取样。`--nccl-bucket-mb` 以 MiB 设置每次 NCCL FP32 梯度求和的最大通信量。

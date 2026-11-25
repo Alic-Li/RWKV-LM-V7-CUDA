@@ -17,15 +17,15 @@ class Model {
 public:
   Model(int device, const Checkpoint &input, const Shape &shape,
         const Weights &layout, int head_chunk, bool optimized_wkv,
-        bool checkpoint_activations);
+        bool checkpoint_activations, int max_rows, bool accumulate, bool clip);
   ~Model();
 
-  void activate() const;
   cudaStream_t stream() const;
   void synchronize() const;
   float *gradients() const;
   std::size_t parameter_count() const;
-  void clear_gradients(bool accumulate_microbatches);
+  void clear_gradients();
+  void warm_optimizer();
   void accumulate(MicroBatch &batch, std::size_t total_targets);
   float gradient_scale(float clip) const;
   void update(const Adam &opt, std::uint64_t step, float scale);

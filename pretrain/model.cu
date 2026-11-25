@@ -55,11 +55,8 @@ struct Device {
     try {
       blas_ok(cublasCreate(&blas));
       blas_ok(cublasSetStream(blas, stream));
-      cudaMemPool_t pool;
-      CUDA(cudaDeviceGetDefaultMemPool(&pool, id));
-      std::uint64_t retain = UINT64_MAX;
-      CUDA(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold,
-                                   &retain));
+      workspace = Buffer<unsigned char>(workspace_bytes);
+      blas_ok(cublasSetWorkspace(blas, workspace.get(), workspace_bytes));
     } catch (...) {
       if (blas)
         cublasDestroy(blas);
@@ -77,6 +74,8 @@ struct Device {
       throw std::runtime_error(std::string("GPU BLAS: ") +
                                cublasGetStatusString(status));
   }
+  static constexpr Count workspace_bytes = 32 * 1024 * 1024;
+  Buffer<unsigned char> workspace;
   int id, resident_threads;
   cudaStream_t stream = nullptr;
   cublasHandle_t blas = nullptr;
@@ -194,37 +193,45 @@ struct BlockWeights {
 };
 
 struct NormCache {
-  Buffer<BF> out;
-  Buffer<float> mean, inv;
+  View<BF> out;
+  View<float> mean, inv;
 };
 struct BlockCache {
   NormCache ln1, ln2;
-  std::array<Buffer<BF>, 6> mixed;
-  Buffer<BF> r, raw_k, raw_v, v, w, w_hidden, a_pre, a_hidden, a, v_pre,
-      v_hidden, g_hidden, g;
-  Buffer<BF> k, neg, kka, recurrent, gated, middle, ffn_mix, ffn_act, output;
-  Buffer<float> key_inv, state, sa, group_mean, group_inv;
+  std::array<View<BF>, 6> mixed;
+  View<BF> r, raw_k, raw_v, v, w, w_hidden, a_pre, a_hidden, a, v_pre, v_hidden,
+      g_hidden, g;
+  View<BF> k, neg, kka, recurrent, gated, middle, ffn_mix, ffn_act, output;
+  View<float> key_inv, state, sa, group_mean, group_inv;
 };
 
 } // namespace
 
 struct Model::Impl {
   Impl(int id, const Checkpoint &input, const Shape &s, const Weights &layout,
-       int chunk, bool optimized_wkv, bool checkpoint)
+       int max_rows, bool accumulate, bool clip, int chunk, bool optimized_wkv,
+       bool checkpoint)
       : gpu(id), shape(s), layout(layout), c(s.channels), h(c / 64), ffn(s.ffn),
-        head_chunk(chunk), optimized_wkv(optimized_wkv),
-        checkpoint(checkpoint) {
+        head_chunk(chunk), optimized_wkv(optimized_wkv), checkpoint(checkpoint),
+        sort_bytes(embedding_sort_bytes(stream(), max_rows)),
+        arena(arena_bytes(s, max_rows, chunk, checkpoint, sort_bytes)) {
     for (const auto &weight : layout) {
       const auto size = weight.size();
       if (size > SIZE_MAX / sizeof(float) - total)
         throw std::runtime_error("model size overflow");
       total += size;
     }
-    weights = bf_buffer(total);
-    master = fp_buffer(total);
-    gradient = fp_buffer(total);
-    first_moment = fp_buffer(total);
-    second_moment = fp_buffer(total);
+    Count largest = 0;
+    for (const auto &weight : layout)
+      largest = std::max(largest, weight.size());
+    checkpoint_staging.resize(std::min(largest, Count(1) << 20));
+    weights = Buffer<BF>(total);
+    master = Buffer<float>(total);
+    gradient = Buffer<float>(total);
+    first_moment = Buffer<float>(total);
+    second_moment = Buffer<float>(total);
+    if (accumulate)
+      accumulated = Buffer<float>(total);
     zero(first_moment.get(), total);
     zero(second_moment.get(), total);
     Count off = 0;
@@ -243,6 +250,8 @@ struct Model::Impl {
       params.emplace(weight.name, p);
       off += p.size;
     }
+    for (const auto &weight : layout)
+      read_weight(params.at(weight.name), [](Count, const std::uint16_t *, Count) {});
     embed = params.at("emb.weight");
     head = params.at("head.weight");
     ln0 = norm_weights("blocks.0.ln0");
@@ -250,11 +259,56 @@ struct Model::Impl {
     blocks.reserve(s.layers);
     for (int i = 0; i < s.layers; ++i)
       blocks.push_back(block_weights(i));
+    if (clip)
+      gradient_norm = std::make_unique<GradientNorm>(
+          stream(), gpu.resident_threads, norm_slices());
+    residuals.reserve(s.layers + 1);
+    if (!checkpoint)
+      saved.reserve(s.layers);
+  }
+
+  // Prime the same D2H transfers used during saves, including the driver's
+  // first use of its large-copy path, while all ranks are still initializing.
+  template<class Consume>
+  void read_weight(Param p, Consume consume) {
+    for (Count off = 0; off < p.size;) {
+      const auto count = std::min(checkpoint_staging.size(), p.size - off);
+      CUDA(cudaMemcpyAsync(checkpoint_staging.data(), p.w + off,
+                           count * sizeof(std::uint16_t), cudaMemcpyDeviceToHost,
+                           stream()));
+      CUDA(cudaStreamSynchronize(stream()));
+      consume(off, checkpoint_staging.data(), count);
+      off += count;
+    }
   }
 
   cudaStream_t stream() const { return gpu.stream; }
-  Buffer<BF> bf_buffer(Count size) const { return {stream(), size}; }
-  Buffer<float> fp_buffer(Count size) const { return {stream(), size}; }
+  // Upper bounds in bytes per row. Each forward block retains the mixed,
+  // projected and FFN activations, FP32 WKV state and normalization statistics.
+  // Reverse traverses one block at a time. Recompute retains only residuals.
+  static Count arena_bytes(const Shape &s, Count rows, Count chunk,
+                           bool checkpoint, Count sort_bytes) {
+    const Count c = s.channels;
+    const Count ranks = Count(s.decay) + s.alpha + s.value + s.gate;
+    const Count forward =
+        checked_sum(16384, checked_product(rows, 96 * c + 2 * ranks +
+                                                     2 * Count(s.ffn) + 32));
+    const Count backward =
+        checked_sum(32768, checked_product(rows, 112 * c + 4 * ranks +
+                                                     2 * Count(s.ffn) + 32));
+    const Count tape = checked_product(
+        s.layers,
+        checkpoint ? checked_sum(256, checked_product(rows, 2 * c)) : forward);
+    const Count base = checked_sum(
+        tape, checked_sum(16384, checked_product(rows, 24 * c + 64)));
+    const Count head = checked_sum(
+        checked_product(2 * c, s.vocab),
+        checked_product(std::min(rows, chunk), 2 * Count(s.vocab) + 4 * c));
+    const Count block = checked_sum(backward, forward);
+    return checked_sum(base, std::max({block, head, sort_bytes}));
+  }
+  View<BF> bf_buffer(Count size) const { return arena.take<BF>(size); }
+  View<float> fp_buffer(Count size) const { return arena.take<float>(size); }
   template <class T> void zero(T *p, Count size) const {
     CUDA(cudaMemsetAsync(p, 0, size * sizeof(T), stream()));
   }
@@ -320,14 +374,22 @@ struct Model::Impl {
   void gemm(int m, int cols, int k, const BF *a, bool ta, const BF *b, bool tb,
             void *out, cudaDataType_t dtype, float beta) const {
     const float alpha = 1.f;
+#ifdef RWKV_ROCM
+    Device::blas_ok(rocblas_gemm_ex(
+        gpu.blas, tb ? CUBLAS_OP_T : CUBLAS_OP_N,
+        ta ? CUBLAS_OP_T : CUBLAS_OP_N, cols, m, k, &alpha, b, CUDA_R_16BF,
+        tb ? k : cols, a, CUDA_R_16BF, ta ? m : k, &beta, out, dtype, cols, out,
+        dtype, cols, CUDA_R_32F, rocblas_gemm_algo_standard, 0, 0));
+#else
     Device::blas_ok(cublasGemmEx(
         gpu.blas, tb ? CUBLAS_OP_T : CUBLAS_OP_N,
         ta ? CUBLAS_OP_T : CUBLAS_OP_N, cols, m, k, &alpha, b, CUDA_R_16BF,
         tb ? k : cols, a, CUDA_R_16BF, ta ? m : k, &beta, out, dtype, cols,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+#endif
   }
-  Buffer<BF> linear(const BF *x, Param p, int in, int out,
-                    bool weight_transposed = true) const {
+  View<BF> linear(const BF *x, Param p, int in, int out,
+                  bool weight_transposed = true) const {
     auto y = bf_buffer(Count(rows) * out);
     gemm(rows, out, in, x, false, p.w, weight_transposed, y.get(), CUDA_R_16BF,
          0.f);
@@ -341,8 +403,8 @@ struct Model::Impl {
     else
       gemm(in, out, m, x, true, dy, false, p.g, CUDA_R_32F, 1.f);
   }
-  Buffer<BF> linear_backward(const BF *x, Param p, const BF *dy, int in,
-                             int out, bool weight_transposed = true) const {
+  View<BF> linear_backward(const BF *x, Param p, const BF *dy, int in, int out,
+                           bool weight_transposed = true) const {
     auto dx = bf_buffer(Count(rows) * in);
     linear_backward_rows(x, p, dy, dx.get(), rows, in, out, weight_transposed);
     return dx;
@@ -354,33 +416,33 @@ struct Model::Impl {
                norm.out.get(), norm.mean.get(), norm.inv.get());
     return norm;
   }
-  Buffer<BF> normalize_backward(const BF *x, const BF *dy, const NormCache &f,
-                                NormWeights p) const {
+  View<BF> normalize_backward(const BF *x, const BF *dy, const NormCache &f,
+                              NormWeights p) const {
     auto dx = bf_buffer(n);
-    layer_norm_backward(stream(), rows, c, x, dy, p.w.w, f.mean.get(),
+    layer_norm_backward(arena, stream(), rows, c, x, dy, p.w.w, f.mean.get(),
                         f.inv.get(), dx.get(), p.w.g, p.b.g);
     return dx;
   }
-  Buffer<BF> low_rank(const BF *x, LowRank p, Buffer<BF> &hidden) const {
+  View<BF> low_rank(const BF *x, LowRank p, View<BF> &hidden) const {
     hidden = linear(x, p.first, c, p.rank, false);
     return linear(hidden.get(), p.second, p.rank, c, false);
   }
-  Buffer<BF> low_rank_activated(const BF *x, LowRank p, Buffer<BF> &hidden,
-                                Activation activation) const {
+  View<BF> low_rank_activated(const BF *x, LowRank p, View<BF> &hidden,
+                              Activation activation) const {
     hidden = linear(x, p.first, c, p.rank, false);
     const Count elems = Count(rows) * p.rank;
     activate_element<<<grid(elems), threads, 0, stream()>>>(hidden.get(), elems,
                                                             activation);
     return linear(hidden.get(), p.second, p.rank, c, false);
   }
-  Buffer<BF> low_rank_backward(const BF *x, LowRank p, const BF *hidden,
-                               const BF *dy) const {
+  View<BF> low_rank_backward(const BF *x, LowRank p, const BF *hidden,
+                             const BF *dy) const {
     const auto dh = linear_backward(hidden, p.second, dy, p.rank, c, false);
     return linear_backward(x, p.first, dh.get(), c, p.rank, false);
   }
-  Buffer<BF> low_rank_activated_backward(const BF *x, LowRank p,
-                                         const BF *hidden, const BF *dy,
-                                         Activation activation) const {
+  View<BF> low_rank_activated_backward(const BF *x, LowRank p, const BF *hidden,
+                                       const BF *dy,
+                                       Activation activation) const {
     auto dh = linear_backward(hidden, p.second, dy, p.rank, c, false);
     const Count elems = Count(rows) * p.rank;
     activate_backward<<<grid(elems), threads, 0, stream()>>>(dh.get(), hidden,
@@ -453,8 +515,8 @@ struct Model::Impl {
     return f;
   }
 
-  Buffer<BF> backward_block(const BF *x, BF *dy, BF *first, BF *d_first,
-                            const BlockCache &f, const BlockWeights &p) const {
+  View<BF> backward_block(const BF *x, BF *dy, BF *first, BF *d_first,
+                          const BlockCache &f, const BlockWeights &p) const {
     auto da_ffn = linear_backward(f.ffn_act.get(), p.ffn_value, dy, ffn, c);
     relu_square_backward(stream(), Count(rows) * ffn, da_ffn.get(),
                          f.ffn_act.get());
@@ -504,9 +566,10 @@ struct Model::Impl {
     alpha_backward(stream(), rows, c, d_alpha.get(), p.a0.w, f.a_pre.get(),
                    d_a_pre.get(), partial.get(), d_a0.get());
     add_bf_to_float<<<grid(c), threads, 0, stream()>>>(d_a0.get(), p.a0.g, c);
-    value_bias_gradient(stream(), rows, c, gpu.resident_threads, ww.get(), p.w0.g);
+    value_bias_gradient(arena, stream(), rows, c, gpu.resident_threads,
+                        ww.get(), p.w0.g);
 
-    std::array<Buffer<BF>, 6> gradients;
+    std::array<View<BF>, 6> gradients;
     gradients[0] = linear_backward(f.mixed[0].get(), p.r, dr.get(), c, c);
     gradients[1] = low_rank_activated_backward(
         f.mixed[1].get(), p.w, f.w_hidden.get(), ww.get(), Activation::Tanh);
@@ -523,7 +586,8 @@ struct Model::Impl {
                           p.v0.w, f.v_pre.get(), d_raw_v.get(), d_base.get(),
                           d_pre_fp.get());
       add<<<grid(n), threads, 0, stream()>>>(d_first, d_base.get(), d_first, n);
-      value_bias_gradient(stream(), rows, c, gpu.resident_threads, d_pre_fp.get(), p.v0.g);
+      value_bias_gradient(arena, stream(), rows, c, gpu.resident_threads,
+                          d_pre_fp.get(), p.v0.g);
       to_bf<<<grid(n), threads, 0, stream()>>>(d_pre_fp.get(), d_v_pre.get(),
                                                n);
       gradients[3] =
@@ -560,6 +624,13 @@ struct Model::Impl {
   int c, h, ffn, head_chunk;
   Count n = 0, total = 0;
   bool optimized_wkv, checkpoint;
+  Count sort_bytes;
+  mutable Arena arena;
+  Buffer<int> bad{1};
+  std::vector<int, PinnedAllocator<int>> finite_status{0};
+  std::vector<std::uint16_t, PinnedAllocator<std::uint16_t>> checkpoint_staging;
+  std::vector<View<BF>> residuals;
+  std::vector<BlockCache> saved;
   Buffer<BF> weights;
   Buffer<float> master, gradient, accumulated, first_moment, second_moment;
   std::unordered_map<std::string, Param> params;
@@ -570,35 +641,29 @@ struct Model::Impl {
 
 Model::Model(int id, const Checkpoint &input, const Shape &s,
              const Weights &layout, int head_chunk, bool optimized_wkv,
-             bool checkpoint_activations)
-    : impl_(std::make_unique<Impl>(id, input, s, layout, head_chunk,
-                                   optimized_wkv, checkpoint_activations)) {}
+             bool checkpoint_activations, int max_rows, bool accumulate,
+             bool clip)
+    : impl_(std::make_unique<Impl>(id, input, s, layout, max_rows, accumulate,
+                                   clip, head_chunk, optimized_wkv,
+                                   checkpoint_activations)) {}
 Model::~Model() {
   (void)cudaSetDevice(impl_->gpu.id);
   impl_.reset();
 }
-void Model::activate() const { CUDA(cudaSetDevice(impl_->gpu.id)); }
 cudaStream_t Model::stream() const { return impl_->stream(); }
 void Model::synchronize() const {
-  activate();
   CUDA(cudaStreamSynchronize(stream()));
 }
 std::size_t Model::parameter_count() const { return impl_->total; }
 float *Model::gradients() const {
   return impl_->accumulated.get() ? impl_->accumulated.get() : impl_->gradient.get();
 }
-void Model::clear_gradients(bool accumulate_microbatches) {
-  activate();
-  if (accumulate_microbatches && !impl_->accumulated.get())
-    impl_->accumulated = impl_->fp_buffer(parameter_count());
-  impl_->zero(gradients(), parameter_count());
-}
+void Model::clear_gradients() { impl_->zero(gradients(), parameter_count()); }
 
 void Model::accumulate(MicroBatch &batch, std::size_t total_targets) {
   const int active = batch.active_rows.size();
   if (!active)
     return;
-  activate();
   auto &m = *impl_;
   const auto s = stream();
   if (m.accumulated.get())
@@ -607,8 +672,10 @@ void Model::accumulate(MicroBatch &batch, std::size_t total_targets) {
   m.time = batch.time;
   m.rows = m.batch * m.time;
   m.n = Count(m.rows) * m.c;
-  const Buffer<int> tokens(s, m.rows), active_rows(s, active);
-  const Buffer<std::int64_t> labels(s, active);
+  m.arena.rewind(0);
+  auto tokens = m.arena.take<int>(m.rows),
+       active_rows = m.arena.take<int>(active);
+  auto labels = m.arena.take<std::int64_t>(active);
   CUDA(cudaMemcpyAsync(tokens.get(), batch.input.data(), m.rows * sizeof(int),
                        cudaMemcpyHostToDevice, s));
   CUDA(cudaMemcpyAsync(active_rows.get(), batch.active_rows.data(),
@@ -621,32 +688,45 @@ void Model::accumulate(MicroBatch &batch, std::size_t total_targets) {
   gather<<<grid(m.n), threads, 0, s>>>(m.embed.w, tokens.get(), emb.get(), m.n,
                                        m.c);
   auto ln0 = m.normalize(emb.get(), m.ln0);
-  std::vector<Buffer<BF>> residuals;
-  residuals.reserve(m.blocks.size() + 1);
-  residuals.push_back(std::move(ln0.out));
-  std::vector<BlockCache> saved;
-  if (!m.checkpoint)
-    saved.reserve(m.blocks.size());
-  Buffer<BF> first;
+  auto &residuals = m.residuals;
+  auto &saved = m.saved;
+  residuals.clear();
+  saved.clear();
+  residuals.push_back(ln0.out);
+  auto first = m.bf_buffer(m.n);
+  const auto copy = [&](View<BF> dest, View<BF> src) {
+    CUDA(cudaMemcpyAsync(dest.get(), src.get(), m.n * sizeof(BF),
+                         cudaMemcpyDeviceToDevice, s));
+  };
   for (const auto &block : m.blocks) {
-    auto f = m.forward_block(residuals.back().get(), first.get(), block, true);
-    if (!first.get())
-      first = std::move(f.raw_v);
-    residuals.push_back(std::move(f.output));
-    if (!m.checkpoint)
-      saved.push_back(std::move(f));
+    const bool initial = residuals.size() == 1;
+    auto output = m.checkpoint ? m.bf_buffer(m.n) : View<BF>{};
+    const auto mark = m.arena.mark();
+    auto f = m.forward_block(residuals.back().get(),
+                             initial ? nullptr : first.get(), block, true);
+    if (initial)
+      copy(first, f.raw_v);
+    if (m.checkpoint) {
+      copy(output, f.output);
+      residuals.push_back(output);
+      m.arena.rewind(mark);
+    } else {
+      residuals.push_back(f.output);
+      saved.push_back(f);
+    }
   }
   const auto ln_out = m.normalize(residuals.back().get(), m.ln_out);
   auto d_hidden = m.bf_buffer(m.n);
   m.zero(d_hidden.get(), m.n);
   batch.losses.resize(active);
+  const auto head_mark = m.arena.mark();
   {
     // The fused loss returns a local mean. Its scalar upstream is applied
     // after the chunked head backward has written its BF16 gradients.
     const float head_scale = __bfloat162float(__float2bfloat16_rn(
         static_cast<float>(static_cast<double>(active) / total_targets)));
     const auto head_grad = m.bf_buffer(m.head.size);
-    const int chunk = std::min(m.head_chunk, active);
+    const int chunk = std::min(m.head_chunk, m.rows);
     const auto logits = m.bf_buffer(Count(chunk) * m.shape.vocab);
     const auto x = m.bf_buffer(Count(chunk) * m.c);
     const auto dx = m.bf_buffer(Count(chunk) * m.c);
@@ -657,13 +737,20 @@ void Model::accumulate(MicroBatch &batch, std::size_t total_targets) {
       const auto *idx = active_rows.get() + start;
       gather<<<grid(elems), threads, 0, s>>>(ln_out.out.get(), idx, x.get(),
                                              elems, m.c);
-      m.gemm(count, m.shape.vocab, m.c, x.get(), false, m.head.w, true,
+      // Keep GEMM shapes fixed, including the final partial chunk. Padded
+      // rows contribute zero to the weight gradient and are never scattered.
+      if (count < chunk)
+        m.zero(x.get() + elems, Count(chunk - count) * m.c);
+      m.gemm(chunk, m.shape.vocab, m.c, x.get(), false, m.head.w, true,
              logits.get(), CUDA_R_16BF, 0.f);
       head_loss(s, count, m.shape.vocab, logits.get(), labels.get() + start,
                 losses.get() + start, 1.f / active);
-      m.gemm(count, m.c, m.shape.vocab, logits.get(), false, m.head.w, false,
+      if (count < chunk)
+        m.zero(logits.get() + Count(count) * m.shape.vocab,
+               Count(chunk - count) * m.shape.vocab);
+      m.gemm(chunk, m.c, m.shape.vocab, logits.get(), false, m.head.w, false,
              dx.get(), CUDA_R_16BF, 0.f);
-      m.gemm(m.shape.vocab, m.c, count, logits.get(), true, x.get(), false,
+      m.gemm(m.shape.vocab, m.c, chunk, logits.get(), true, x.get(), false,
              head_grad.get(), CUDA_R_16BF, start == 0 ? 0.f : 1.f);
       scatter<<<grid(elems), threads, 0, s>>>(dx.get(), idx, d_hidden.get(),
                                               elems, m.c, head_scale);
@@ -674,6 +761,7 @@ void Model::accumulate(MicroBatch &batch, std::size_t total_targets) {
     CUDA(cudaMemcpyAsync(batch.losses.data(), losses.get(),
                          active * sizeof(float), cudaMemcpyDeviceToHost, s));
   }
+  m.arena.rewind(head_mark);
   auto dy = m.normalize_backward(residuals.back().get(), d_hidden.get(), ln_out,
                                  m.ln_out);
   const auto d_first = m.bf_buffer(m.n);
@@ -683,46 +771,58 @@ void Model::accumulate(MicroBatch &batch, std::size_t total_targets) {
     BF *base = layer ? first.get() : nullptr;
     auto *x = residuals[layer].get();
     residuals.pop_back();
+    const auto mark = m.arena.mark();
     auto f =
         m.checkpoint ? m.forward_block(x, base, p, false) : std::move(saved[layer]);
-    if (!m.checkpoint && !layer)
-      f.raw_v = std::move(first);
-    dy = m.backward_block(x, dy.get(), base, d_first.get(), f, p);
+    copy(dy, m.backward_block(x, dy.get(), base, d_first.get(), f, p));
+    m.arena.rewind(mark);
   }
   const auto d_emb = m.normalize_backward(emb.get(), dy.get(), ln0, m.ln0);
-  embedding_gradient(s, m.rows, m.c, tokens.get(), d_emb.get(), m.embed.g);
+  embedding_gradient(m.arena, m.sort_bytes, s, m.rows, m.c, tokens.get(),
+                     d_emb.get(), m.embed.g);
   finish_microbatch<<<grid(m.total), threads, 0, s>>>(
       m.gradient.get(), m.accumulated.get(), m.total);
   CUDA(cudaGetLastError());
 }
 
 float Model::gradient_scale(float clip) const {
-  activate();
   const auto s = stream();
   auto &m = *impl_;
   if (clip > 0.f) {
-    if (!m.gradient_norm)
-      m.gradient_norm = std::make_unique<GradientNorm>(s, m.gpu.resident_threads, m.norm_slices());
     const float norm = m.gradient_norm->compute(s, gradients());
     if (!std::isfinite(norm))
       throw std::runtime_error("non-finite gradient norm");
     // PyTorch scalar / tensor uses reciprocal followed by multiplication.
     return std::min(1.f, (1.f / (norm + 1e-6f)) * clip);
   }
-  const Buffer<int> bad(s, 1);
+  const auto &bad = m.bad;
   m.zero(bad.get(), 1);
   check_finite<<<std::min(grid(m.total), 4096u), threads, 0, s>>>(
       gradients(), m.total, bad.get());
-  int nonfinite;
-  CUDA(cudaMemcpyAsync(&nonfinite, bad.get(), sizeof(int), cudaMemcpyDeviceToHost, s));
+  CUDA(cudaMemcpyAsync(m.finite_status.data(), bad.get(), sizeof(int),
+                       cudaMemcpyDeviceToHost, s));
   synchronize();
-  if (nonfinite)
+  if (m.finite_status.front())
     throw std::runtime_error("non-finite gradient");
   return 1.f;
 }
 
+// Prime the optimizer kernel using temporary local state. No checkpoint weight
+// or moment participates in this launch.
+void Model::warm_optimizer() {
+  auto &m = *impl_;
+  m.arena.rewind(0);
+  auto *state = m.arena.take<float>(4).get();
+  auto weight = m.arena.take<BF>(1);
+  m.zero(state, 4);
+  AdamStep options{};
+  options.eps = 1.f;
+  adam_update(stream(), weight.get(), state, state + 1, state + 2, state + 3, 1,
+              options, 1.f);
+  CUDA(cudaGetLastError());
+}
+
 void Model::update(const Adam &opt, std::uint64_t step, float scale) {
-  activate();
   auto &m = *impl_;
   const auto standard = adam_step(opt, step, opt.lr, 0.);
   const auto decayed = adam_step(opt, step, opt.lr, opt.decay);
@@ -745,13 +845,12 @@ void Model::update(const Adam &opt, std::uint64_t step, float scale) {
 }
 
 void Model::save(const std::string &path) const {
-  activate();
   save_weights(path, impl_->layout, [&](const auto &w) {
     const auto p = impl_->params.at(w.name);
     std::vector<std::uint16_t> values(p.size);
-    CUDA(cudaMemcpyAsync(values.data(), p.w, p.size * sizeof(values[0]),
-                         cudaMemcpyDeviceToHost, stream()));
-    synchronize();
+    impl_->read_weight(p, [&](Count off, const std::uint16_t *data, Count count) {
+      std::copy_n(data, count, values.data() + off);
+    });
     return values;
   });
 }

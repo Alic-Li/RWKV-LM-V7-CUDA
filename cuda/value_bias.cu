@@ -46,8 +46,8 @@ __global__ void reduce_rows(const T *terms, float *output, int rows,
 } // namespace
 
 template <typename T>
-void value_bias_gradient(cudaStream_t stream, int rows, int channels,
-                         int resident_threads, const T *terms,
+void value_bias_gradient(Arena &arena, cudaStream_t stream, int rows,
+                         int channels, int resident_threads, const T *terms,
                          float *gradient) {
   // Model widths are multiples of 64 and padded sequence lengths are multiples
   // of 16.
@@ -72,14 +72,14 @@ void value_bias_gradient(cudaStream_t stream, int rows, int channels,
   // Limit the number of partials for very large batches.
   // CUDA grid.y has a limit of 65535; the row loop can consume the remainder.
   parts = std::min(parts, 65535);
-  Buffer<float> partial(stream, std::size_t(parts) * channels);
+  auto partial = arena.take<float>(std::size_t(parts) * channels);
   reduce_rows<false><<<dim3(groups, parts), threads, 0, stream>>>(
       terms, partial.get(), rows, channels);
   reduce_rows<true><<<groups, threads, 0, stream>>>(partial.get(), gradient,
                                                     parts, channels);
 }
-template void value_bias_gradient(cudaStream_t, int, int, int, const float *,
-                                  float *);
-template void value_bias_gradient(cudaStream_t, int, int, int,
+template void value_bias_gradient(Arena &, cudaStream_t, int, int, int,
+                                  const float *, float *);
+template void value_bias_gradient(Arena &, cudaStream_t, int, int, int,
                                   const __nv_bfloat16 *, float *);
 } // namespace rwkv

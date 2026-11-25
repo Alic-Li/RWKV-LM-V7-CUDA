@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <cuda_runtime.h>
 #include <limits>
 #include <new>
@@ -23,7 +24,7 @@ template <class T> struct PinnedAllocator {
     if (n > std::numeric_limits<std::size_t>::max() / sizeof(T))
       throw std::bad_array_new_length();
     T *p;
-    CUDA(cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocPortable));
+    CUDA(cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocDefault));
     return p;
   }
   void deallocate(T *p, std::size_t) { (void)cudaFreeHost(p); }
@@ -35,30 +36,63 @@ template <class T> struct PinnedAllocator {
   }
 };
 
+// Owning buffers are created during initialization. Training temporaries use
+// non-owning typed views into the model's compute-stream arena.
+inline std::size_t checked_product(std::size_t a, std::size_t b) {
+  if (b && a > SIZE_MAX / b)
+    throw std::length_error("device buffer size overflow");
+  return a * b;
+}
+inline std::size_t checked_sum(std::size_t a, std::size_t b) {
+  if (a > SIZE_MAX - b)
+    throw std::length_error("device buffer size overflow");
+  return a + b;
+}
+
 template <typename T> class Buffer {
 public:
   Buffer() = default;
-  Buffer(cudaStream_t stream, std::size_t n) : stream_(stream) {
+  explicit Buffer(std::size_t n) {
     if (n)
-      CUDA(cudaMallocAsync(&ptr_, n * sizeof(T), stream_));
+      CUDA(cudaMalloc(&ptr_, checked_product(n, sizeof(T))));
   }
   ~Buffer() {
     if (ptr_)
-      (void)cudaFreeAsync(ptr_, stream_);
+      (void)cudaFree(ptr_);
   }
   Buffer(const Buffer &) = delete;
   Buffer &operator=(const Buffer &) = delete;
-  Buffer(Buffer &&other) noexcept
-      : ptr_(std::exchange(other.ptr_, nullptr)), stream_(other.stream_) {}
+  Buffer(Buffer &&other) noexcept : ptr_(std::exchange(other.ptr_, nullptr)) {}
   Buffer &operator=(Buffer &&other) noexcept {
     std::swap(ptr_, other.ptr_);
-    std::swap(stream_, other.stream_);
     return *this;
   }
   T *get() const { return ptr_; }
-
 private:
   T *ptr_ = nullptr;
-  cudaStream_t stream_ = nullptr;
+};
+
+template <class T> struct View {
+  T *ptr = nullptr;
+  T *get() const { return ptr; }
+};
+
+class Arena {
+public:
+  explicit Arena(std::size_t bytes) : storage_(bytes), capacity_(bytes) {}
+  template <class T> View<T> take(std::size_t n) {
+    const auto start = checked_sum(offset_, 255) & ~std::size_t(255);
+    const auto end = checked_sum(start, checked_product(n, sizeof(T)));
+    if (end > capacity_)
+      throw std::length_error("compute arena capacity exceeded");
+    offset_ = end;
+    return {reinterpret_cast<T *>(storage_.get() + start)};
+  }
+  std::size_t mark() const { return offset_; }
+  void rewind(std::size_t mark) { offset_ = mark; }
+
+private:
+  Buffer<unsigned char> storage_;
+  std::size_t capacity_, offset_ = 0;
 };
 } // namespace rwkv

@@ -24,6 +24,7 @@ private:
   static Group group(GradientSlice slice, unsigned start, int resident_threads);
   unsigned groups_, partials_;
   Group final_;
+  mutable std::vector<float, PinnedAllocator<float>> host_result_{0.f};
   Buffer<Group> plan_;
   Buffer<unsigned> owners_;
   Buffer<float> partial_, norms_, final_partial_, result_;

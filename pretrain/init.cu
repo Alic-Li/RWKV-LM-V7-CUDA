@@ -37,9 +37,14 @@ __global__ void pack_q(const float *q, const float *signs, __nv_bfloat16 *out,
 class Initializer {
 public:
   explicit Initializer(std::uint64_t seed) : rng_(seed) {
+    CUDA(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
     solver_ok(cusolverDnCreate(&solver_));
+    solver_ok(cusolverDnSetStream(solver_, stream_));
   }
-  ~Initializer() { cusolverDnDestroy(solver_); }
+  ~Initializer() {
+    cusolverDnDestroy(solver_);
+    (void)cudaStreamDestroy(stream_);
+  }
 
   std::vector<std::uint16_t> make(const Weight &w, const Shape &s) {
     const auto &name = w.name;
@@ -129,42 +134,43 @@ private:
     const int rows = w.dims[0], cols = w.dims[1];
     const int m = std::max(rows, cols), n = std::min(rows, cols);
     const std::size_t size = w.size();
-    Buffer<float> q(nullptr, size), tau(nullptr, n), sign(nullptr, n);
-    Buffer<int> info(nullptr, 1);
+    Buffer<float> q(size), tau(n), sign(n);
+    Buffer<int> info(1);
     std::vector<float> host(size);
     std::normal_distribution<float> gaussian;
     for (auto &v : host)
       v = gaussian(rng_);
     CUDA(cudaMemcpyAsync(q.get(), host.data(), size * sizeof(float),
-                         cudaMemcpyHostToDevice));
+                         cudaMemcpyHostToDevice, stream_));
     int qr_size, q_size;
     solver_ok(cusolverDnSgeqrf_bufferSize(solver_, m, n, q.get(), m, &qr_size));
     solver_ok(cusolverDnSorgqr_bufferSize(solver_, m, n, n, q.get(), m,
                                           tau.get(), &q_size));
-    Buffer<float> work(nullptr, std::max(qr_size, q_size));
+    Buffer<float> work(std::max(qr_size, q_size));
     solver_ok(cusolverDnSgeqrf(solver_, m, n, q.get(), m, tau.get(), work.get(),
                                qr_size, info.get()));
     int qr_info;
     CUDA(cudaMemcpyAsync(&qr_info, info.get(), sizeof(int),
-                         cudaMemcpyDeviceToHost));
-    save_signs<<<(n + 255) / 256, 256>>>(q.get(), sign.get(), m, n);
+                         cudaMemcpyDeviceToHost, stream_));
+    save_signs<<<(n + 255) / 256, 256, 0, stream_>>>(q.get(), sign.get(), m, n);
     solver_ok(cusolverDnSorgqr(solver_, m, n, n, q.get(), m, tau.get(),
                                work.get(), q_size, info.get()));
     int q_info;
     CUDA(cudaMemcpyAsync(&q_info, info.get(), sizeof(int),
-                         cudaMemcpyDeviceToHost));
-    Buffer<__nv_bfloat16> packed(nullptr, size);
-    pack_q<<<(size + 255) / 256, 256>>>(q.get(), sign.get(), packed.get(), rows,
-                                        cols, gain);
+                         cudaMemcpyDeviceToHost, stream_));
+    Buffer<__nv_bfloat16> packed(size);
+    pack_q<<<(size + 255) / 256, 256, 0, stream_>>>(
+        q.get(), sign.get(), packed.get(), rows, cols, gain);
     CUDA(cudaGetLastError());
     std::vector<std::uint16_t> result(size);
     CUDA(cudaMemcpyAsync(result.data(), packed.get(), size * sizeof(result[0]),
-                         cudaMemcpyDeviceToHost));
-    CUDA(cudaStreamSynchronize(nullptr));
+                         cudaMemcpyDeviceToHost, stream_));
+    CUDA(cudaStreamSynchronize(stream_));
     if (qr_info || q_info)
       throw std::runtime_error("QR failed for " + w.name);
     return result;
   }
+  cudaStream_t stream_;
   std::mt19937_64 rng_;
   cusolverDnHandle_t solver_ = nullptr;
 };

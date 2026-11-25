@@ -11,3 +11,4 @@ using cusolverStatus_t = hipsolverStatus_t;
 #define cusolverDnSgeqrf_bufferSize hipsolverDnSgeqrf_bufferSize
 #define cusolverDnSorgqr hipsolverDnSorgqr
 #define cusolverDnSorgqr_bufferSize hipsolverDnSorgqr_bufferSize
+#define cusolverDnSetStream hipsolverSetStream

@@ -3,14 +3,11 @@
 
 using cudaError_t = hipError_t;
 using cudaDeviceProp = hipDeviceProp_t;
-using cudaMemPool_t = hipMemPool_t;
 using cudaStream_t = hipStream_t;
 
 #define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
-#define cudaDeviceGetDefaultMemPool hipDeviceGetDefaultMemPool
 #define cudaErrorNotReady hipErrorNotReady
-#define cudaFreeAsync hipFreeAsync
 #define cudaFreeHost hipHostFree
 #define cudaGetDevice hipGetDevice
 #define cudaGetDeviceCount hipGetDeviceCount
@@ -18,10 +15,6 @@ using cudaStream_t = hipStream_t;
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
 #define cudaHostAlloc hipHostMalloc
-#define cudaHostAllocPortable hipHostMallocPortable
-#define cudaMallocAsync hipMallocAsync
-#define cudaMemPoolAttrReleaseThreshold hipMemPoolAttrReleaseThreshold
-#define cudaMemPoolSetAttribute hipMemPoolSetAttribute
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
@@ -33,3 +26,16 @@ using cudaStream_t = hipStream_t;
 #define cudaStreamQuery hipStreamQuery
 #define cudaStreamSynchronize hipStreamSynchronize
 #define cudaSuccess hipSuccess
+#define cudaMalloc hipMalloc
+#define cudaFree hipFree
+#define cudaMemGetInfo hipMemGetInfo
+#define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
+#define cudaHostAllocDefault hipHostMallocDefault
+#define cudaEvent_t hipEvent_t
+#define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
+#define cudaStreamCreateWithPriority hipStreamCreateWithPriority
+#define cudaEventCreateWithFlags hipEventCreateWithFlags
+#define cudaEventDisableTiming hipEventDisableTiming
+#define cudaStreamWaitEvent hipStreamWaitEvent
+#define cudaEventRecord hipEventRecord
+#define cudaEventDestroy hipEventDestroy
