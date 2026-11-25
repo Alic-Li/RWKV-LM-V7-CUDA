@@ -83,6 +83,11 @@ void rwkv::hip_ops::wkv_forward(hipStream_t stream, int B,int T,int H,bf*r,bf*w,
 //###################################################################################################### 
 
 template<int N>
+#if defined(__gfx90a__)
+// Each lane carries three N-element FP32 states across timesteps. Allow a
+// single resident wave per SIMD so gfx90a can keep these states in registers.
+__launch_bounds__(N, 1)
+#endif
 __global__ void backward_kernel(int T, int H, F_ r_, F_ w_, F_ k_, F_ v_, F_ a_, F_ b_, F_ dy_, float * __restrict__ s__, float * __restrict__ sa_, bf* dr_, bf* dw_, bf* dk_, bf* dv_, bf* da_, bf* db_)
 {
     int bb = blockIdx.y, hh = blockIdx.x, i = threadIdx.x;
